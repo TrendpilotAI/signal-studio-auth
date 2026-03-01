@@ -1,0 +1,45 @@
+-- ============================================================
+-- Migration 003: RLS template for existing Signal Builder tables
+--
+-- Apply this pattern to every tenant-scoped table.
+-- Replace {{TABLE}} with the actual table name.
+-- ============================================================
+
+-- Example for a generic tenant table:
+-- ALTER TABLE public.{{TABLE}} ENABLE ROW LEVEL SECURITY;
+--
+-- CREATE POLICY "org_isolation_select" ON public.{{TABLE}}
+--     FOR SELECT
+--     USING (
+--         organization_id = (
+--             (auth.jwt() -> 'app_metadata' ->> 'organization_id')::bigint
+--         )
+--     );
+--
+-- CREATE POLICY "org_isolation_insert" ON public.{{TABLE}}
+--     FOR INSERT
+--     WITH CHECK (
+--         organization_id = (
+--             (auth.jwt() -> 'app_metadata' ->> 'organization_id')::bigint
+--         )
+--     );
+--
+-- CREATE POLICY "org_isolation_update" ON public.{{TABLE}}
+--     FOR UPDATE
+--     USING (
+--         organization_id = (
+--             (auth.jwt() -> 'app_metadata' ->> 'organization_id')::bigint
+--         )
+--     );
+--
+-- CREATE POLICY "org_isolation_delete" ON public.{{TABLE}}
+--     FOR DELETE
+--     USING (
+--         organization_id = (
+--             (auth.jwt() -> 'app_metadata' ->> 'organization_id')::bigint
+--         )
+--     );
+--
+-- CREATE POLICY "service_role_bypass" ON public.{{TABLE}}
+--     FOR ALL
+--     USING (auth.role() = 'service_role');
