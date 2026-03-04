@@ -445,15 +445,38 @@ async def me(request: Request):
     return user.dict(by_alias=True)
 
 
+def _get_caller_role(request: Request) -> str:
+    """
+    Extract the caller's role from the Supabase JWT claims attached by middleware.
+    Falls back to an empty string if claims are unavailable.
+    Role is stored in app_metadata.role within the JWT.
+    """
+    claims = getattr(request.state, "supabase_claims", None)
+    if claims:
+        return claims.get("app_metadata", {}).get("role", "")
+    return ""
+
+
 @router.post("/invite-to-org")
 async def invite_to_org(body: InviteRequest, request: Request):
     """
     Invite a user to an organization (admin-only).
     Creates a Supabase user with pre-set org metadata.
+
+    Requires the caller to be authenticated AND have the 'admin' role
+    in their Supabase app_metadata.
     """
     caller = getattr(request.state, "user", None)
     if not caller or not caller.is_authenticated:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # SECURITY: enforce admin role — any authenticated user must NOT be able to invite
+    caller_role = _get_caller_role(request)
+    if caller_role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required to invite users to an organization",
+        )
 
     async with httpx.AsyncClient() as client:
         # Use admin API to create / invite

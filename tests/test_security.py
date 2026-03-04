@@ -233,3 +233,118 @@ class TestRateLimiting:
 
         assert resp_a.status_code == 429
         assert resp_b.status_code != 429
+
+
+# ---------------------------------------------------------------------------
+# TODO-353: Admin role check on /invite-to-org
+# ---------------------------------------------------------------------------
+
+class TestInviteToOrgAdminCheck:
+    """
+    /auth/invite-to-org must only be accessible to admin-role users.
+    Authenticated non-admins should get 403 Forbidden.
+    Unauthenticated callers should get 401.
+    """
+
+    def _make_app_with_user(self, is_authenticated: bool, role: str | None):
+        """Build a test FastAPI app with a stubbed auth state."""
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from routes.auth_routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        @app.middleware("http")
+        async def _inject_user(request: Request, call_next):
+            if not is_authenticated:
+                # Mimic AnonymousUser by not setting state.user
+                pass
+            else:
+                class _FakeUser:
+                    is_authenticated = True
+                request.state.user = _FakeUser()
+                if role is not None:
+                    request.state.supabase_claims = {
+                        "app_metadata": {"role": role}
+                    }
+                else:
+                    request.state.supabase_claims = {}
+            return await call_next(request)
+
+        return app
+
+    def test_unauthenticated_returns_401(self):
+        """No user → 401."""
+        app = self._make_app_with_user(is_authenticated=False, role=None)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/auth/invite-to-org",
+            json={"email": "new@example.com", "organization_id": 1, "role": "viewer"},
+        )
+        assert resp.status_code == 401
+
+    def test_authenticated_viewer_returns_403(self):
+        """Authenticated but role=viewer → 403 Forbidden."""
+        app = self._make_app_with_user(is_authenticated=True, role="viewer")
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/auth/invite-to-org",
+            json={"email": "new@example.com", "organization_id": 1, "role": "viewer"},
+        )
+        assert resp.status_code == 403
+        assert "Admin role required" in resp.json().get("detail", "")
+
+    def test_authenticated_analyst_returns_403(self):
+        """Authenticated but role=analyst → 403 Forbidden."""
+        app = self._make_app_with_user(is_authenticated=True, role="analyst")
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/auth/invite-to-org",
+            json={"email": "new@example.com", "organization_id": 1, "role": "analyst"},
+        )
+        assert resp.status_code == 403
+
+    def test_no_role_in_claims_returns_403(self):
+        """Authenticated with no role field in claims → 403 Forbidden (default deny)."""
+        app = self._make_app_with_user(is_authenticated=True, role=None)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post(
+            "/auth/invite-to-org",
+            json={"email": "new@example.com", "organization_id": 1},
+        )
+        assert resp.status_code == 403
+
+    def test_admin_role_proceeds_to_supabase(self):
+        """Authenticated with role=admin → passes the role check, hits Supabase."""
+        from unittest.mock import AsyncMock, patch, MagicMock
+
+        app = self._make_app_with_user(is_authenticated=True, role="admin")
+        client = TestClient(app, raise_server_exceptions=False)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "uuid-123", "action_link": "https://..."}
+
+        async def _mock_post(*args, **kwargs):
+            return mock_resp
+
+        async def _mock_put(*args, **kwargs):
+            return mock_resp
+
+        with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            instance.post = _mock_post
+            instance.put = _mock_put
+            MockClient.return_value = instance
+
+            resp = client.post(
+                "/auth/invite-to-org",
+                json={"email": "new@example.com", "organization_id": 1, "role": "viewer"},
+            )
+
+        # Should pass the role check and return 200 from Supabase mock
+        assert resp.status_code == 200
+        assert resp.json().get("detail") == "Invitation sent"
