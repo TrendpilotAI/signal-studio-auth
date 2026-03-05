@@ -20,12 +20,13 @@ import logging
 import time
 import uuid
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from threading import Lock
 from typing import Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr
 
 from config.redis_config import get_redis, REDIS_URL
 from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
@@ -33,6 +34,28 @@ from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+
+# ---------------------------------------------------------------------------
+# Shared HTTP client helper (TODO-600)
+# ---------------------------------------------------------------------------
+
+@asynccontextmanager
+async def _http_client(request: Request):
+    """
+    Yield the shared httpx.AsyncClient from app.state (set by lifespan), or
+    fall back to creating a per-request client when running in test mode
+    (i.e., no lifespan context / app.state.http_client not configured).
+
+    This keeps existing tests working without modification while giving
+    production code a connection-pooled client.
+    """
+    shared = getattr(request.app.state, "http_client", None)
+    if shared is not None:
+        yield shared
+    else:
+        async with httpx.AsyncClient() as client:
+            yield client
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -285,6 +308,8 @@ def _wrap_with_opaque_token(supabase_response: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 class SignupRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     email: EmailStr
     password: str
     first_name: str = ""
@@ -293,19 +318,27 @@ class SignupRequest(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     email: EmailStr
     password: str
 
 
 class RefreshRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     refresh_token: str
 
 
 class LogoutRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     refresh_token: str | None = None
 
 
 class InviteRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     email: EmailStr
     organization_id: int
     role: str = "viewer"
@@ -342,7 +375,7 @@ def _extract_token(request: Request) -> str:
 async def signup(body: SignupRequest, request: Request):
     """Register a new user via Supabase Auth."""
     _signup_limiter.check(_client_ip(request))
-    async with httpx.AsyncClient() as client:
+    async with _http_client(request) as client:
         resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/signup",
             headers=_supabase_headers(service=True),
@@ -368,7 +401,7 @@ async def signup(body: SignupRequest, request: Request):
 async def login(body: LoginRequest, request: Request):
     """Authenticate and receive tokens (refresh token is opaque UUID)."""
     _login_limiter.check(_client_ip(request))
-    async with httpx.AsyncClient() as client:
+    async with _http_client(request) as client:
         resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/token?grant_type=password",
             headers=_supabase_headers(),
@@ -398,7 +431,7 @@ async def refresh(body: RefreshRequest, request: Request):
             detail="Invalid or expired refresh token",
         )
 
-    async with httpx.AsyncClient() as client:
+    async with _http_client(request) as client:
         resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/token?grant_type=refresh_token",
             headers=_supabase_headers(),
@@ -425,7 +458,7 @@ async def logout(request: Request, body: LogoutRequest | None = None):
     token = request.headers.get("Authorization", "").split(" ")[-1]
     if token:
         try:
-            async with httpx.AsyncClient() as client:
+            async with _http_client(request) as client:
                 await client.post(
                     f"{SUPABASE_URL}/auth/v1/logout",
                     headers=_supabase_headers(access_token=token),
@@ -442,7 +475,7 @@ async def me(request: Request):
     user = getattr(request.state, "user", None)
     if user is None or not user.is_authenticated:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    return user.dict(by_alias=True)
+    return user.model_dump(by_alias=True)
 
 
 def _get_caller_role(request: Request) -> str:
@@ -478,7 +511,7 @@ async def invite_to_org(body: InviteRequest, request: Request):
             detail="Admin role required to invite users to an organization",
         )
 
-    async with httpx.AsyncClient() as client:
+    async with _http_client(request) as client:
         # Use admin API to create / invite
         resp = await client.post(
             f"{SUPABASE_URL}/auth/v1/admin/generate_link",

@@ -1,13 +1,18 @@
 """
 Lightweight stand-ins for the legacy Signal Builder User/AnonymousUser models.
 Used when the middleware runs outside the legacy codebase (tests, standalone).
+
+TODO-404: Migrated to Pydantic v2 (ConfigDict, model_dump, model_validate).
 """
 
-from pydantic import BaseModel, EmailStr, Field
 from typing import Any
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 
 class UserOrganization(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     id: int
     name: str
     vertical: str
@@ -23,23 +28,31 @@ class UserOrganization(BaseModel):
 
 
 class User(BaseModel):
+    model_config = ConfigDict(
+        populate_by_name=True,
+        from_attributes=True,  # replaces orm_mode=True
+    )
+
     id: int = Field(alias="user_id")
     username: str
     email: str
     organization: UserOrganization
 
-    class Config:
-        orm_mode = True
-        populate_by_name = True
-        # pydantic v1 compat
-        allow_population_by_field_name = True
-
     @property
     def is_authenticated(self) -> bool:
         return True
 
+    def model_dump(self, **kwargs) -> dict[str, Any]:
+        return super().model_dump(**kwargs)
+
+    # Backward-compat alias so existing code using .dict() still works during migration
+    def dict(self, **kwargs) -> dict[str, Any]:  # noqa: D102
+        return self.model_dump(**kwargs)
+
 
 class AnonymousUser(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     @property
     def is_authenticated(self) -> bool:
         return False
