@@ -344,6 +344,18 @@ class InviteRequest(BaseModel):
     role: str = "viewer"
 
 
+class PasswordResetRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    email: EmailStr
+
+
+class PasswordUpdateRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    new_password: str
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -543,3 +555,55 @@ async def invite_to_org(body: InviteRequest, request: Request):
             )
 
     return {"detail": "Invitation sent", "email": body.email}
+
+
+@router.post("/reset-password")
+async def reset_password(body: PasswordResetRequest, request: Request):
+    """
+    Trigger a Supabase password-reset email.
+
+    Always returns 200 to prevent email enumeration attacks.
+    """
+    try:
+        async with _http_client(request) as client:
+            await client.post(
+                f"{SUPABASE_URL}/auth/v1/recover",
+                headers=_supabase_headers(),
+                json={"email": body.email},
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("reset_password: Supabase call failed: %s", exc)
+
+    # Always 200 — never reveal whether the account exists
+    return {"message": "If an account exists, a reset email has been sent."}
+
+
+@router.post("/update-password")
+async def update_password(body: PasswordUpdateRequest, request: Request):
+    """
+    Authenticated user changes their password.
+
+    Requires a valid Bearer token in the Authorization header.
+    Password must be at least 8 characters.
+    """
+    user = getattr(request.state, "user", None)
+    if not user or not user.is_authenticated:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    if len(body.new_password) < 8:
+        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+
+    access_token = _extract_token(request)
+
+    async with _http_client(request) as client:
+        resp = await client.put(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers=_supabase_headers(access_token=access_token),
+            json={"password": body.new_password},
+        )
+
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=400, detail="Password update failed")
+
+    logger.info("update_password: password changed for user %s", getattr(user, "sub", "unknown"))
+    return {"message": "Password updated successfully"}
