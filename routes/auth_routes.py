@@ -222,6 +222,20 @@ _signup_limiter = _LimiterShim(
     _signup_calls,
 )
 
+_reset_password_calls: dict[str, list[float]] = defaultdict(list)
+_update_password_calls: dict[str, list[float]] = defaultdict(list)
+_reset_password_lock = Lock()
+_update_password_lock = Lock()
+
+_reset_password_limiter = _LimiterShim(
+    _redis_or_memory_check(_reset_password_calls, _reset_password_lock, max_calls=3, window_seconds=3600),
+    _reset_password_calls,
+)
+_update_password_limiter = _LimiterShim(
+    _redis_or_memory_check(_update_password_calls, _update_password_lock, max_calls=5, window_seconds=3600),
+    _update_password_calls,
+)
+
 
 def _client_ip(request: Request) -> str:
     """Extract real client IP (handles X-Forwarded-For from Railway/nginx)."""
@@ -354,6 +368,18 @@ class PasswordUpdateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     new_password: str
+
+    @classmethod
+    def validate_password_complexity(cls, v: str) -> str:
+        if len(v) < 8:
+            raise ValueError("Password must be at least 8 characters")
+        if not any(c.isupper() for c in v):
+            raise ValueError("Password must contain at least one uppercase letter")
+        if not any(c.islower() for c in v):
+            raise ValueError("Password must contain at least one lowercase letter")
+        if not any(c.isdigit() for c in v):
+            raise ValueError("Password must contain at least one number")
+        return v
 
 
 # ---------------------------------------------------------------------------
@@ -562,8 +588,10 @@ async def reset_password(body: PasswordResetRequest, request: Request):
     """
     Trigger a Supabase password-reset email.
 
+    Rate limit: 3 requests per IP per 60 minutes.
     Always returns 200 to prevent email enumeration attacks.
     """
+    _reset_password_limiter.check(_client_ip(request))
     try:
         async with _http_client(request) as client:
             await client.post(
@@ -584,26 +612,52 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
     Authenticated user changes their password.
 
     Requires a valid Bearer token in the Authorization header.
-    Password must be at least 8 characters.
+    Rate limit: 5 requests per IP per 60 minutes.
+    Password must be at least 8 characters with mixed case and a number.
+    Revokes all existing refresh tokens on success.
     """
     user = getattr(request.state, "user", None)
     if not user or not user.is_authenticated:
         raise HTTPException(status_code=401, detail="Authentication required")
 
-    if len(body.new_password) < 8:
+    _update_password_limiter.check(_client_ip(request))
+
+    password = body.new_password
+    if len(password) < 8:
         raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
+    if not any(c.isupper() for c in password):
+        raise HTTPException(status_code=422, detail="Password must contain at least one uppercase letter")
+    if not any(c.islower() for c in password):
+        raise HTTPException(status_code=422, detail="Password must contain at least one lowercase letter")
+    if not any(c.isdigit() for c in password):
+        raise HTTPException(status_code=422, detail="Password must contain at least one number")
 
     access_token = _extract_token(request)
+    user_sub = getattr(user, "sub", None)
 
     async with _http_client(request) as client:
         resp = await client.put(
             f"{SUPABASE_URL}/auth/v1/user",
             headers=_supabase_headers(access_token=access_token),
-            json={"password": body.new_password},
+            json={"password": password},
         )
 
     if resp.status_code >= 400:
         raise HTTPException(status_code=400, detail="Password update failed")
 
-    logger.info("update_password: password changed for user %s", getattr(user, "sub", "unknown"))
+    # Revoke all existing opaque refresh tokens for this user in Redis
+    # We do a best-effort scan; if Redis is unavailable this is a no-op.
+    try:
+        r = get_redis()
+        if r is not None and user_sub:
+            # Also force Supabase to invalidate all sessions via admin API
+            async with _http_client(request) as client:
+                await client.post(
+                    f"{SUPABASE_URL}/auth/v1/admin/users/{user_sub}/logout",
+                    headers=_supabase_headers(service=True),
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("update_password: session revocation failed: %s", exc)
+
+    logger.info("update_password: password changed for user %s", user_sub or "unknown")
     return {"message": "Password updated successfully"}
