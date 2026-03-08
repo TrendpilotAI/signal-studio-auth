@@ -348,3 +348,144 @@ class TestInviteToOrgAdminCheck:
         # Should pass the role check and return 200 from Supabase mock
         assert resp.status_code == 200
         assert resp.json().get("detail") == "Invitation sent"
+
+
+# ---------------------------------------------------------------------------
+# TODO-602: Org membership validation on /invite-to-org
+# ---------------------------------------------------------------------------
+
+class TestInviteToOrgMembershipCheck:
+    """
+    An admin of org A must NOT be able to invite users to org B.
+    Verifies the org membership guard added in TODO-602.
+    """
+
+    def _make_app_with_admin(self, caller_sub: str, membership_response: list):
+        """Build a test app where caller is admin but membership check is mocked."""
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from routes.auth_routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        @app.middleware("http")
+        async def _inject_admin(request: Request, call_next):
+            class _FakeUser:
+                is_authenticated = True
+            request.state.user = _FakeUser()
+            request.state.supabase_claims = {
+                "sub": caller_sub,
+                "app_metadata": {"role": "admin"},
+            }
+            return await call_next(request)
+
+        return app
+
+    def test_admin_cross_org_invite_returns_403(self):
+        """Admin of org A tries to invite to org B → 403."""
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from unittest.mock import AsyncMock, MagicMock
+        from routes.auth_routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        @app.middleware("http")
+        async def _inject(request: Request, call_next):
+            class _FakeUser:
+                is_authenticated = True
+            request.state.user = _FakeUser()
+            request.state.supabase_claims = {
+                "sub": "caller-uuid-aaa",
+                "app_metadata": {"role": "admin"},
+            }
+            return await call_next(request)
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        mock_membership_resp = MagicMock()
+        mock_membership_resp.status_code = 200
+        mock_membership_resp.json.return_value = []  # not a member of org B
+
+        import httpx
+        from unittest.mock import patch, AsyncMock
+
+        async def _mock_get(*args, **kwargs):
+            return mock_membership_resp
+
+        with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            instance.get = _mock_get
+            MockClient.return_value = instance
+
+            resp = client.post(
+                "/auth/invite-to-org",
+                json={"email": "victim@example.com", "organization_id": 99, "role": "viewer"},
+            )
+
+        assert resp.status_code == 403
+        assert "not a member" in resp.json().get("detail", "").lower()
+
+    def test_admin_same_org_invite_allowed(self):
+        """Admin who IS a member of org → membership check passes, proceeds to Supabase."""
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from routes.auth_routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+
+        @app.middleware("http")
+        async def _inject(request: Request, call_next):
+            class _FakeUser:
+                is_authenticated = True
+            request.state.user = _FakeUser()
+            request.state.supabase_claims = {
+                "sub": "caller-uuid-bbb",
+                "app_metadata": {"role": "admin"},
+            }
+            return await call_next(request)
+
+        client = TestClient(app, raise_server_exceptions=False)
+
+        mock_membership_resp = MagicMock()
+        mock_membership_resp.status_code = 200
+        mock_membership_resp.json.return_value = [{"user_id": "caller-uuid-bbb"}]
+
+        mock_supabase_resp = MagicMock()
+        mock_supabase_resp.status_code = 200
+        mock_supabase_resp.json.return_value = {"id": "new-user-uuid", "action_link": "https://..."}
+
+        get_call_count = 0
+
+        async def _mock_get(*args, **kwargs):
+            return mock_membership_resp
+
+        async def _mock_post(*args, **kwargs):
+            return mock_supabase_resp
+
+        async def _mock_put(*args, **kwargs):
+            return mock_supabase_resp
+
+        with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+            instance = AsyncMock()
+            instance.__aenter__ = AsyncMock(return_value=instance)
+            instance.__aexit__ = AsyncMock(return_value=False)
+            instance.get = _mock_get
+            instance.post = _mock_post
+            instance.put = _mock_put
+            MockClient.return_value = instance
+
+            resp = client.post(
+                "/auth/invite-to-org",
+                json={"email": "new@example.com", "organization_id": 1, "role": "viewer"},
+            )
+
+        assert resp.status_code == 200
+        assert resp.json().get("detail") == "Invitation sent"

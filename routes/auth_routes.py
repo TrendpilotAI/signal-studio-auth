@@ -549,6 +549,31 @@ async def invite_to_org(body: InviteRequest, request: Request):
             detail="Admin role required to invite users to an organization",
         )
 
+    # SECURITY: enforce org membership — an admin of org A must NOT be able to invite to org B
+    caller_claims = getattr(request.state, "supabase_claims", None)
+    caller_user_id = caller_claims.get("sub") if caller_claims else None
+    if caller_user_id:
+        async with _http_client(request) as membership_client:
+            membership_resp = await membership_client.get(
+                f"{SUPABASE_URL}/rest/v1/organization_members",
+                params={
+                    "user_id": f"eq.{caller_user_id}",
+                    "org_id": f"eq.{body.organization_id}",
+                    "select": "user_id",
+                    "limit": "1",
+                },
+                headers={
+                    **_supabase_headers(service=True),
+                    "Accept": "application/json",
+                },
+            )
+            members = membership_resp.json() if membership_resp.status_code == 200 else []
+            if not isinstance(members, list) or len(members) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="You are not a member of this organization.",
+                )
+
     async with _http_client(request) as client:
         # Use admin API to create / invite
         resp = await client.post(
