@@ -246,71 +246,146 @@ def _client_ip(request: Request) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Opaque refresh token helpers (TODO-403)
+# Refresh token family tracking helpers (TODO-603)
+#
+# Redis data model:
+#   rt:{token_id}         HASH  {user_id, family_id, parent_id, supabase_token, consumed}
+#   rt:family:{family_id} SET   all token_ids belonging to this family
+#
+# On rotation the old token is marked consumed=1 (not deleted) so that
+# a reuse attempt can be detected.  Reuse → full family revocation (theft
+# detection).  The family SET is used to enumerate all tokens to delete.
 # ---------------------------------------------------------------------------
 
-def _generate_opaque_token() -> str:
-    """Generate a random opaque refresh token."""
-    return str(uuid.uuid4())
-
-
-def _store_opaque_token(opaque_token: str, supabase_refresh_token: str) -> None:
+def _issue_family_token(supabase_token: str,
+                        user_id: str = "",
+                        parent_id: str = "",
+                        family_id: Optional[str] = None) -> str:
     """
-    Store opaque → supabase_refresh_token mapping in Redis (TTL = 7 days).
-    Falls back to no-op if Redis is unavailable (Supabase handles revocation natively).
+    Issue a new opaque refresh token in a token family.
+
+    Creates a new family when family_id is None (initial login / signup).
+    Returns the new opaque token_id.  Falls back to a plain UUID if Redis
+    is unavailable (no persistence — Supabase handles session revocation).
+    """
+    token_id = str(uuid.uuid4())
+    fid = family_id or str(uuid.uuid4())
+
+    r = get_redis()
+    if r is None:
+        return token_id  # No Redis — opaque token has no server-side state
+
+    pipe = r.pipeline()
+    pipe.hset(f"rt:{token_id}", mapping={
+        "user_id": user_id,
+        "family_id": fid,
+        "parent_id": parent_id,
+        "supabase_token": supabase_token,
+        "consumed": "0",
+    })
+    pipe.expire(f"rt:{token_id}", REFRESH_TOKEN_TTL)
+    pipe.sadd(f"rt:family:{fid}", token_id)
+    pipe.expire(f"rt:family:{fid}", REFRESH_TOKEN_TTL)
+    pipe.execute()
+    return token_id
+
+
+def _rotate_family_token(old_token_id: str, new_supabase_token: str) -> str:
+    """
+    Rotate a refresh token within its family.
+
+    Marks the old token as consumed and issues a new child token.
+    If the old token is already consumed (i.e. was reused), the entire
+    family is revoked and an HTTP 401 is raised (theft detection).
+
+    Returns the new opaque token_id.
     """
     r = get_redis()
     if r is None:
-        return
-    key = f"{REFRESH_TOKEN_PREFIX}{opaque_token}"
-    r.setex(key, REFRESH_TOKEN_TTL, supabase_refresh_token)
+        # No Redis — issue a bare token (no theft detection possible)
+        return str(uuid.uuid4())
 
+    data = r.hgetall(f"rt:{old_token_id}")
+    if not data:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        )
 
-def _consume_opaque_token(opaque_token: str) -> Optional[str]:
-    """
-    Atomically retrieve and delete an opaque token from Redis.
-    Returns the associated Supabase refresh token, or None if not found / Redis down.
-    """
-    r = get_redis()
-    if r is None:
-        # No Redis — pass the opaque token through as-is (Supabase will reject invalid ones)
-        return opaque_token
+    if data.get("consumed") == "1":
+        # ── THEFT DETECTED ──────────────────────────────────────────────
+        # A consumed (already-rotated) token was presented.  The legitimate
+        # user's token chain and the attacker's chain share the same family.
+        # Revoke every token in the family to force a full re-login.
+        family_id = data.get("family_id", "")
+        if family_id:
+            family_members = r.smembers(f"rt:family:{family_id}")
+            pipe = r.pipeline()
+            for member_id in family_members:
+                pipe.delete(f"rt:{member_id}")
+            pipe.delete(f"rt:family:{family_id}")
+            pipe.execute()
+        logger.warning(
+            "Refresh token theft detected: token_id=%s family=%s user=%s",
+            old_token_id, family_id, data.get("user_id", ""),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Refresh token reuse detected — all sessions revoked",
+        )
 
-    key = f"{REFRESH_TOKEN_PREFIX}{opaque_token}"
-    # GETDEL atomically returns and removes the key (Redis ≥ 6.2)
-    try:
-        value = r.getdel(key)
-    except Exception:
-        # Older Redis — fall back to GET + DEL
-        value = r.get(key)
-        if value:
-            r.delete(key)
-    return value  # None if token doesn't exist (already used or expired)
+    # Mark old token as consumed (do NOT delete — we need it for reuse detection)
+    r.hset(f"rt:{old_token_id}", "consumed", "1")
+
+    # Issue new child token in the same family
+    return _issue_family_token(
+        supabase_token=new_supabase_token,
+        user_id=data.get("user_id", ""),
+        parent_id=old_token_id,
+        family_id=data.get("family_id"),
+    )
 
 
 def _revoke_opaque_token(opaque_token: str) -> bool:
     """
     Delete an opaque token from Redis (logout / revocation).
+    Also removes the token from its family SET to keep it tidy.
     Returns True if the token existed, False otherwise.
     """
     r = get_redis()
     if r is None:
         return True  # No Redis, nothing to revoke
-    key = f"{REFRESH_TOKEN_PREFIX}{opaque_token}"
-    return bool(r.delete(key))
+
+    key = f"rt:{opaque_token}"
+    data = r.hgetall(key)
+    existed = bool(data)
+
+    pipe = r.pipeline()
+    pipe.delete(key)
+    family_id = data.get("family_id", "") if data else ""
+    if family_id:
+        pipe.srem(f"rt:family:{family_id}", opaque_token)
+    pipe.execute()
+    return existed
 
 
-def _wrap_with_opaque_token(supabase_response: dict) -> dict:
+def _wrap_with_opaque_token(supabase_response: dict, user_id: str = "") -> dict:
     """
-    Replace the Supabase refresh_token in the response with an opaque one.
-    Stores the mapping in Redis.  Returns the modified response.
+    Replace the Supabase refresh_token in the response with an opaque family token.
+    Creates a new token family (called on initial login / signup).
+    Returns the modified response dict.
     """
     sb_refresh = supabase_response.get("refresh_token")
     if not sb_refresh:
         return supabase_response
 
-    opaque = _generate_opaque_token()
-    _store_opaque_token(opaque, sb_refresh)
+    # Extract user_id from the response if not supplied
+    if not user_id:
+        user_id = (
+            supabase_response.get("user", {}) or {}
+        ).get("id", "")
+
+    opaque = _issue_family_token(supabase_token=sb_refresh, user_id=user_id)
 
     result = dict(supabase_response)
     result["refresh_token"] = opaque
@@ -453,21 +528,47 @@ async def login(body: LoginRequest, request: Request):
 @router.post("/refresh")
 async def refresh(body: RefreshRequest, request: Request):
     """
-    Rotate refresh token.
+    Rotate refresh token with family tracking (TODO-603).
 
-    Validates the opaque refresh token from Redis, exchanges the underlying
-    Supabase token for a new access+refresh pair, revokes the old opaque
-    token, and issues a new opaque refresh token.
+    1. Look up the opaque token in Redis (hash).
+    2. If already consumed → theft detected → revoke entire family → 401.
+    3. If valid → mark consumed, call Supabase, issue child token in same family.
     """
-    opaque_token = body.refresh_token.strip()
+    old_token_id = body.refresh_token.strip()
 
-    # Consume (validate + delete) the opaque token
-    supabase_refresh = _consume_opaque_token(opaque_token)
-    if supabase_refresh is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired refresh token",
-        )
+    r = get_redis()
+    if r is not None:
+        token_data = r.hgetall(f"rt:{old_token_id}")
+        if not token_data:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired refresh token",
+            )
+        if token_data.get("consumed") == "1":
+            # ── THEFT DETECTED ──────────────────────────────────────────
+            family_id = token_data.get("family_id", "")
+            if family_id:
+                family_members = r.smembers(f"rt:family:{family_id}")
+                pipe = r.pipeline()
+                for member_id in family_members:
+                    pipe.delete(f"rt:{member_id}")
+                pipe.delete(f"rt:family:{family_id}")
+                pipe.execute()
+            logger.warning(
+                "Refresh token theft detected: token_id=%s family=%s user=%s",
+                old_token_id, token_data.get("family_id", ""), token_data.get("user_id", ""),
+            )
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token reuse detected — all sessions revoked",
+            )
+        supabase_refresh = token_data["supabase_token"]
+        # Mark old token consumed before calling Supabase (prevents double-use race)
+        r.hset(f"rt:{old_token_id}", "consumed", "1")
+    else:
+        # No Redis — treat the opaque token as the Supabase token directly
+        token_data = None
+        supabase_refresh = old_token_id
 
     async with _http_client(request) as client:
         resp = await client.post(
@@ -478,7 +579,23 @@ async def refresh(body: RefreshRequest, request: Request):
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
 
-    return _wrap_with_opaque_token(resp.json())
+    supabase_data = resp.json()
+    new_supabase_rt = supabase_data.get("refresh_token", "")
+
+    if r is None or token_data is None:
+        return _wrap_with_opaque_token(supabase_data)
+
+    # Issue child token in same family
+    new_token_id = _issue_family_token(
+        supabase_token=new_supabase_rt,
+        user_id=token_data.get("user_id", ""),
+        parent_id=old_token_id,
+        family_id=token_data.get("family_id"),
+    )
+
+    result = dict(supabase_data)
+    result["refresh_token"] = new_token_id
+    return result
 
 
 @router.post("/logout")

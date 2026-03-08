@@ -42,8 +42,8 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 # ---------------------------------------------------------------------------
 
 def _fake_redis() -> fakeredis.FakeRedis:
-    """Return a fresh in-process FakeRedis instance."""
-    return fakeredis.FakeRedis()
+    """Return a fresh in-process FakeRedis instance (decode_responses matches production config)."""
+    return fakeredis.FakeRedis(decode_responses=True)
 
 
 def _build_test_app():
@@ -80,66 +80,103 @@ def _mock_supabase_post(response_body: dict, status_code: int = 200):
 # TestRefreshTokenRotation
 # ---------------------------------------------------------------------------
 
+def _seed_family_token(redis, token_id: str, supabase_token: str,
+                        user_id: str = "user-123",
+                        family_id: Optional[str] = None,
+                        parent_id: str = "",
+                        consumed: str = "0",
+                        ttl: int = 600) -> str:
+    """Helper: seed a token hash + family SET into fakeredis."""
+    fid = family_id or str(uuid.uuid4())
+    redis.hset(f"rt:{token_id}", mapping={
+        "user_id": user_id,
+        "family_id": fid,
+        "parent_id": parent_id,
+        "supabase_token": supabase_token,
+        "consumed": consumed,
+    })
+    redis.expire(f"rt:{token_id}", ttl)
+    redis.sadd(f"rt:family:{fid}", token_id)
+    redis.expire(f"rt:family:{fid}", ttl)
+    return fid
+
+
+from typing import Optional
+
+
 class TestRefreshTokenRotation:
     """
     /auth/refresh Redis round-trip tests.
 
     fakeredis is patched in as the get_redis() return value so all
-    SETEX / GETDEL operations use real Redis semantics.
+    hash / set operations use real Redis semantics.
     """
 
     def test_valid_token_issues_new_token_and_consumes_old(self):
         """POST /auth/refresh with valid opaque token → new access+refresh tokens returned."""
-        from routes.auth_routes import REFRESH_TOKEN_PREFIX
-
         redis = _fake_redis()
-        opaque = str(uuid.uuid4())
-        supabase_rt = "supabase-rt-original"
-        # Pre-seed the opaque → supabase RT mapping
-        redis.setex(f"{REFRESH_TOKEN_PREFIX}{opaque}", 60, supabase_rt)
+        token_id = str(uuid.uuid4())
+        family_id = _seed_family_token(redis, token_id, "supabase-rt-original")
 
         new_response = _make_supabase_token_response()
         client = _build_test_app()
 
         with patch("routes.auth_routes.get_redis", return_value=redis):
             with patch("httpx.AsyncClient", _mock_supabase_post(new_response)):
-                resp = client.post("/auth/refresh", json={"refresh_token": opaque})
+                resp = client.post("/auth/refresh", json={"refresh_token": token_id})
 
         assert resp.status_code == 200
         data = resp.json()
-        # New access token from Supabase must be returned
         assert data["access_token"] == "new.access.jwt"
-        # Returned refresh token must be a NEW opaque UUID (not the Supabase one)
-        new_opaque = data["refresh_token"]
-        assert new_opaque != supabase_rt
-        uuid.UUID(new_opaque, version=4)  # must be valid UUID4
-        # Old token must be consumed (deleted from Redis)
-        assert redis.get(f"{REFRESH_TOKEN_PREFIX}{opaque}") is None
-        # New opaque token must be stored in Redis
-        assert redis.get(f"{REFRESH_TOKEN_PREFIX}{new_opaque}") is not None
 
-    def test_consumed_token_returns_401(self):
-        """POST /auth/refresh with already-rotated (consumed) token → 401."""
-        from routes.auth_routes import REFRESH_TOKEN_PREFIX
+        # Returned refresh token must be a NEW opaque UUID
+        new_token_id = data["refresh_token"]
+        assert new_token_id != token_id
+        uuid.UUID(new_token_id, version=4)
 
+        # Old token must be marked consumed (not deleted — needed for theft detection)
+        old_data = redis.hgetall(f"rt:{token_id}")
+        assert old_data.get("consumed") == "1"
+
+        # New token must be stored in Redis in the same family
+        new_data = redis.hgetall(f"rt:{new_token_id}")
+        assert new_data.get("family_id") == family_id
+        assert new_data.get("parent_id") == token_id
+        assert new_data.get("consumed") == "0"
+
+        # Both tokens must be members of the family SET
+        family_members = redis.smembers(f"rt:family:{family_id}")
+        assert token_id in family_members
+        assert new_token_id in family_members
+
+    def test_consumed_token_returns_401_and_revokes_family(self):
+        """
+        POST /auth/refresh with already-rotated (consumed) token → 401 AND entire
+        family is revoked (theft detection).
+        """
         redis = _fake_redis()
-        opaque = str(uuid.uuid4())
-        redis.setex(f"{REFRESH_TOKEN_PREFIX}{opaque}", 60, "supabase-rt-once")
+        family_id = str(uuid.uuid4())
 
-        new_response = _make_supabase_token_response()
+        # Simulate: token_a was consumed (rotated to token_b)
+        token_a = str(uuid.uuid4())
+        token_b = str(uuid.uuid4())
+        _seed_family_token(redis, token_a, "sb-rt-a", family_id=family_id, consumed="1")
+        _seed_family_token(redis, token_b, "sb-rt-b", family_id=family_id, parent_id=token_a)
+
         client = _build_test_app()
-
         with patch("routes.auth_routes.get_redis", return_value=redis):
-            with patch("httpx.AsyncClient", _mock_supabase_post(new_response)):
-                # First use — should succeed
-                resp1 = client.post("/auth/refresh", json={"refresh_token": opaque})
-                # Second use of the SAME original opaque token — already consumed
-                resp2 = client.post("/auth/refresh", json={"refresh_token": opaque})
+            # Attacker reuses the consumed token_a
+            resp = client.post("/auth/refresh", json={"refresh_token": token_a})
 
-        assert resp1.status_code == 200
-        assert resp2.status_code == 401
-        detail = resp2.json()["detail"].lower()
-        assert "expired" in detail or "invalid" in detail
+        assert resp.status_code == 401
+        detail = resp.json()["detail"].lower()
+        assert "reuse" in detail or "revoked" in detail or "theft" in detail
+
+        # Both tokens must be deleted from Redis
+        assert redis.hgetall(f"rt:{token_a}") == {}
+        assert redis.hgetall(f"rt:{token_b}") == {}
+        # Family SET must be deleted
+        assert redis.smembers(f"rt:family:{family_id}") == set()
 
     def test_fabricated_token_returns_401(self):
         """POST /auth/refresh with completely unknown token → 401."""
@@ -156,6 +193,61 @@ class TestRefreshTokenRotation:
         detail = resp.json()["detail"].lower()
         assert "expired" in detail or "invalid" in detail
 
+    def test_legitimate_rotation_then_theft_revokes_all(self):
+        """
+        Full scenario: login → legitimate rotate → attacker reuses original token
+        → both the original and the child should be revoked.
+        """
+        redis = _fake_redis()
+        family_id = str(uuid.uuid4())
+
+        # Initial token issued at login
+        original_token = str(uuid.uuid4())
+        _seed_family_token(redis, original_token, "sb-original", family_id=family_id)
+
+        new_response = _make_supabase_token_response(refresh="sb-new")
+        client = _build_test_app()
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            with patch("httpx.AsyncClient", _mock_supabase_post(new_response)):
+                # Legitimate user rotates
+                resp1 = client.post("/auth/refresh", json={"refresh_token": original_token})
+        assert resp1.status_code == 200
+        child_token = resp1.json()["refresh_token"]
+
+        # Attacker (or network replay) reuses the now-consumed original token
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            resp2 = client.post("/auth/refresh", json={"refresh_token": original_token})
+        assert resp2.status_code == 401
+
+        # Both original and child must now be revoked
+        assert redis.hgetall(f"rt:{original_token}") == {}
+        assert redis.hgetall(f"rt:{child_token}") == {}
+        assert redis.smembers(f"rt:family:{family_id}") == set()
+
+    def test_legitimate_user_refresh_after_theft_detection_fails(self):
+        """
+        After theft revokes the family, the legitimate user's child token
+        must also be invalid (forces full re-login).
+        """
+        redis = _fake_redis()
+        family_id = str(uuid.uuid4())
+
+        original = str(uuid.uuid4())
+        child = str(uuid.uuid4())
+        # Attacker already rotated original → child, original is consumed
+        _seed_family_token(redis, original, "sb-orig", family_id=family_id, consumed="1")
+        _seed_family_token(redis, child, "sb-child", family_id=family_id, parent_id=original)
+
+        client = _build_test_app()
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            # Legitimate user (with original) detects theft → revokes family
+            client.post("/auth/refresh", json={"refresh_token": original})
+            # Attacker tries to use child token — should also fail (revoked)
+            resp = client.post("/auth/refresh", json={"refresh_token": child})
+
+        assert resp.status_code == 401
+
 
 # ---------------------------------------------------------------------------
 # TestLogoutRevocation
@@ -168,11 +260,9 @@ class TestLogoutRevocation:
 
     def test_logout_revokes_token_in_redis(self):
         """POST /auth/logout removes the opaque token from Redis."""
-        from routes.auth_routes import REFRESH_TOKEN_PREFIX
-
         redis = _fake_redis()
         opaque = str(uuid.uuid4())
-        redis.setex(f"{REFRESH_TOKEN_PREFIX}{opaque}", 60, "supabase-rt-logout")
+        _seed_family_token(redis, opaque, "supabase-rt-logout")
 
         logout_mock = MagicMock()
         logout_resp = MagicMock()
@@ -191,16 +281,14 @@ class TestLogoutRevocation:
 
         assert resp.status_code == 200
         assert resp.json()["detail"] == "Logged out"
-        # Token must be gone from Redis
-        assert redis.get(f"{REFRESH_TOKEN_PREFIX}{opaque}") is None
+        # Token hash must be gone from Redis
+        assert redis.hgetall(f"rt:{opaque}") == {}
 
     def test_revoked_token_cannot_refresh(self):
         """After logout, the same token must be rejected by /auth/refresh (401)."""
-        from routes.auth_routes import REFRESH_TOKEN_PREFIX
-
         redis = _fake_redis()
         opaque = str(uuid.uuid4())
-        redis.setex(f"{REFRESH_TOKEN_PREFIX}{opaque}", 60, "supabase-rt-to-revoke")
+        _seed_family_token(redis, opaque, "supabase-rt-to-revoke")
 
         logout_resp = MagicMock()
         logout_resp.status_code = 204
