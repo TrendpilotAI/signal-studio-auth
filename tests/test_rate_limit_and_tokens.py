@@ -47,38 +47,47 @@ class TestRateLimiterFallback:
 
     def test_in_memory_allows_under_limit(self):
         """Check() should not raise when under the limit."""
-        from routes.auth_routes import _build_rate_limiter
+        from collections import defaultdict
+        from threading import Lock
+        from routes.auth_routes import _make_shim_check
 
-        with patch("routes.auth_routes.get_redis", return_value=None):
-            check = _build_rate_limiter(max_calls=3, window_seconds=60)
-            # 3 calls should all pass
-            for _ in range(3):
-                check("127.0.0.1")
+        calls: dict = defaultdict(list)
+        lock = Lock()
+        check = _make_shim_check(calls, lock, max_calls=3, window_seconds=60)
+        # 3 calls should all pass
+        for _ in range(3):
+            check("127.0.0.1")
 
     def test_in_memory_raises_at_limit(self):
         """4th call should raise HTTP 429."""
+        from collections import defaultdict
+        from threading import Lock
         from fastapi import HTTPException
-        from routes.auth_routes import _build_rate_limiter
+        from routes.auth_routes import _make_shim_check
 
-        with patch("routes.auth_routes.get_redis", return_value=None):
-            check = _build_rate_limiter(max_calls=3, window_seconds=60)
-            for _ in range(3):
-                check("127.0.0.1")
-            with pytest.raises(HTTPException) as exc_info:
-                check("127.0.0.1")
-            assert exc_info.value.status_code == 429
+        calls: dict = defaultdict(list)
+        lock = Lock()
+        check = _make_shim_check(calls, lock, max_calls=3, window_seconds=60)
+        for _ in range(3):
+            check("127.0.0.1")
+        with pytest.raises(HTTPException) as exc_info:
+            check("127.0.0.1")
+        assert exc_info.value.status_code == 429
 
     def test_in_memory_different_ips_are_independent(self):
         """Different IPs should have independent counters."""
-        from routes.auth_routes import _build_rate_limiter
+        from collections import defaultdict
+        from threading import Lock
+        from routes.auth_routes import _make_shim_check
 
-        with patch("routes.auth_routes.get_redis", return_value=None):
-            check = _build_rate_limiter(max_calls=2, window_seconds=60)
-            check("1.2.3.4")
-            check("1.2.3.4")
-            # ip2 should still have budget
-            check("5.6.7.8")
-            check("5.6.7.8")
+        calls: dict = defaultdict(list)
+        lock = Lock()
+        check = _make_shim_check(calls, lock, max_calls=2, window_seconds=60)
+        check("1.2.3.4")
+        check("1.2.3.4")
+        # ip2 should still have budget
+        check("5.6.7.8")
+        check("5.6.7.8")
 
 
 class TestRateLimiterRedis:
@@ -86,35 +95,36 @@ class TestRateLimiterRedis:
 
     def test_redis_limiter_is_used_when_available(self):
         """When Redis is reachable, the limits library should be used."""
-        from routes.auth_routes import _build_rate_limiter
+        from collections import defaultdict
+        from threading import Lock
+        from routes.auth_routes import _redis_or_memory_check
 
+        calls: dict = defaultdict(list)
+        lock = Lock()
         mock_redis = MagicMock()
-        mock_redis.ping.return_value = True
-
         mock_limiter = MagicMock()
         mock_limiter.hit.return_value = True  # allow
-
         mock_storage = MagicMock()
 
         with patch("routes.auth_routes.get_redis", return_value=mock_redis), \
-             patch("config.redis_config.REDIS_URL", "redis://localhost:6379"), \
-             patch("routes.auth_routes.get_redis", return_value=mock_redis):
-
-            # Patch the limits imports inside the function
+             patch("config.redis_config.REDIS_URL", "redis://localhost:6379"):
             with patch.dict("sys.modules", {
                 "limits": MagicMock(parse=MagicMock(return_value=MagicMock())),
                 "limits.storage": MagicMock(RedisStorage=MagicMock(return_value=mock_storage)),
                 "limits.strategies": MagicMock(SlidingWindowRateLimiter=MagicMock(return_value=mock_limiter)),
             }):
-                # Just verify it doesn't raise and the function returns callable
-                check = _build_rate_limiter(max_calls=5, window_seconds=60)
+                check = _redis_or_memory_check(calls, lock, max_calls=5, window_seconds=60)
                 assert callable(check)
 
     def test_redis_limiter_raises_429_when_limit_hit(self):
         """When the Redis limiter returns False (limit hit), should raise 429."""
+        from collections import defaultdict
+        from threading import Lock
         from fastapi import HTTPException
-        from routes.auth_routes import _build_rate_limiter
+        from routes.auth_routes import _redis_or_memory_check
 
+        calls: dict = defaultdict(list)
+        lock = Lock()
         mock_redis = MagicMock()
         mock_limiter = MagicMock()
         mock_limiter.hit.return_value = False  # limit exceeded
@@ -126,7 +136,7 @@ class TestRateLimiterRedis:
                 "limits.storage": MagicMock(RedisStorage=MagicMock(return_value=mock_storage)),
                 "limits.strategies": MagicMock(SlidingWindowRateLimiter=MagicMock(return_value=mock_limiter)),
             }):
-                check = _build_rate_limiter(max_calls=5, window_seconds=60)
+                check = _redis_or_memory_check(calls, lock, max_calls=5, window_seconds=60)
                 with pytest.raises(HTTPException) as exc_info:
                     check("10.0.0.1")
                 assert exc_info.value.status_code == 429
