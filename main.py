@@ -13,6 +13,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 
+from middleware.security_headers import SecurityHeadersMiddleware
 from routes.auth_routes import router
 
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+app.add_middleware(SecurityHeadersMiddleware)
 app.include_router(router)
 
 
