@@ -26,7 +26,7 @@ from typing import Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request, status
-from pydantic import BaseModel, ConfigDict, EmailStr
+from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
 from config.redis_config import get_redis, REDIS_URL
 from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
@@ -378,6 +378,7 @@ class PasswordUpdateRequest(BaseModel):
 
     new_password: str
 
+    @field_validator('new_password')
     @classmethod
     def validate_password_complexity(cls, v: str) -> str:
         if len(v) < 8:
@@ -464,9 +465,11 @@ async def refresh(body: RefreshRequest, request: Request):
     """
     Rotate refresh token with family tracking (TODO-603).
 
-    1. Look up the opaque token in Redis (hash).
-    2. If already consumed → theft detected → revoke entire family → 401.
-    3. If valid → mark consumed, call Supabase, issue child token in same family.
+    1. Look up the opaque token in Redis to get the underlying Supabase token.
+       If the token is already consumed (reuse detected), delegate immediately to
+       _rotate_family_token() — which handles theft detection — without hitting Supabase.
+    2. Call Supabase to exchange the token.
+    3. Call _rotate_family_token() to mark the old token consumed and issue a child token.
     """
     old_token_id = body.refresh_token.strip()
 
@@ -478,30 +481,13 @@ async def refresh(body: RefreshRequest, request: Request):
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired refresh token",
             )
+        # If already consumed, delegate to _rotate_family_token immediately —
+        # it detects the theft, revokes the family, and raises 401. No Supabase call needed.
         if token_data.get("consumed") == "1":
-            # ── THEFT DETECTED ──────────────────────────────────────────
-            family_id = token_data.get("family_id", "")
-            if family_id:
-                family_members = r.smembers(f"rt:family:{family_id}")
-                pipe = r.pipeline()
-                for member_id in family_members:
-                    pipe.delete(f"rt:{member_id}")
-                pipe.delete(f"rt:family:{family_id}")
-                pipe.execute()
-            logger.warning(
-                "Refresh token theft detected: token_id=%s family=%s user=%s",
-                old_token_id, token_data.get("family_id", ""), token_data.get("user_id", ""),
-            )
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token reuse detected — all sessions revoked",
-            )
+            _rotate_family_token(old_token_id, "")  # always raises HTTP 401
         supabase_refresh = token_data["supabase_token"]
-        # Mark old token consumed before calling Supabase (prevents double-use race)
-        r.hset(f"rt:{old_token_id}", "consumed", "1")
     else:
         # No Redis — treat the opaque token as the Supabase token directly
-        token_data = None
         supabase_refresh = old_token_id
 
     async with _http_client(request) as client:
@@ -516,16 +502,8 @@ async def refresh(body: RefreshRequest, request: Request):
     supabase_data = resp.json()
     new_supabase_rt = supabase_data.get("refresh_token", "")
 
-    if r is None or token_data is None:
-        return _wrap_with_opaque_token(supabase_data)
-
-    # Issue child token in same family
-    new_token_id = _issue_family_token(
-        supabase_token=new_supabase_rt,
-        user_id=token_data.get("user_id", ""),
-        parent_id=old_token_id,
-        family_id=token_data.get("family_id"),
-    )
+    # _rotate_family_token marks old token consumed and issues child token in same family.
+    new_token_id = _rotate_family_token(old_token_id, new_supabase_rt)
 
     result = dict(supabase_data)
     result["refresh_token"] = new_token_id
@@ -686,16 +664,8 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
 
     _update_password_limiter.check(_client_ip(request))
 
+    # Password complexity is enforced by PasswordUpdateRequest.validate_password_complexity()
     password = body.new_password
-    if len(password) < 8:
-        raise HTTPException(status_code=422, detail="Password must be at least 8 characters")
-    if not any(c.isupper() for c in password):
-        raise HTTPException(status_code=422, detail="Password must contain at least one uppercase letter")
-    if not any(c.islower() for c in password):
-        raise HTTPException(status_code=422, detail="Password must contain at least one lowercase letter")
-    if not any(c.isdigit() for c in password):
-        raise HTTPException(status_code=422, detail="Password must contain at least one number")
-
     access_token = _extract_token(request)
     user_sub = getattr(user, "sub", None)
 

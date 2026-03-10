@@ -182,10 +182,11 @@ class TestUpdatePassword:
         _update_password_calls.clear()
 
     def test_unauthenticated_returns_401(self):
-        """No auth → 401."""
+        """No auth → 401 (password complexity validated by field_validator before route runs,
+        so we must send a valid password to reach the auth check)."""
         app = _make_app(authenticated=False)
         client = TestClient(app)
-        resp = client.post("/auth/update-password", json={"new_password": "newpass123"})
+        resp = client.post("/auth/update-password", json={"new_password": "Newpass123"})
         assert resp.status_code == 401
 
     def test_password_too_short_returns_422(self):
@@ -212,7 +213,8 @@ class TestUpdatePassword:
             )
 
         assert resp.status_code == 422
-        assert "8 characters" in resp.json()["detail"]
+        # detail is a list of pydantic validation errors
+        assert any("8 characters" in str(err) for err in resp.json()["detail"])
 
     def test_password_exactly_8_chars_accepted(self):
         """Password of exactly 8 chars with complexity → 200."""
@@ -347,7 +349,8 @@ class TestUpdatePassword:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 422
-        assert "uppercase" in resp.json()["detail"].lower()
+        # detail is a list of pydantic validation errors
+        assert any("uppercase" in str(err).lower() for err in resp.json()["detail"])
 
     def test_password_no_lowercase_rejected(self):
         """Password with no lowercase → 422."""
@@ -360,7 +363,8 @@ class TestUpdatePassword:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 422
-        assert "lowercase" in resp.json()["detail"].lower()
+        # detail is a list of pydantic validation errors
+        assert any("lowercase" in str(err).lower() for err in resp.json()["detail"])
 
     def test_password_no_number_rejected(self):
         """Password with no number → 422."""
@@ -373,7 +377,8 @@ class TestUpdatePassword:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert resp.status_code == 422
-        assert "number" in resp.json()["detail"].lower()
+        # detail is a list of pydantic validation errors
+        assert any("number" in str(err).lower() for err in resp.json()["detail"])
 
 
 # ---------------------------------------------------------------------------

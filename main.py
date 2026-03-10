@@ -10,8 +10,7 @@ import logging
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, Request
-from fastapi.responses import Response
+from fastapi import FastAPI
 
 from middleware.security_headers import SecurityHeadersMiddleware
 from routes.auth_routes import router
@@ -52,19 +51,6 @@ app = FastAPI(
 
 app.add_middleware(SecurityHeadersMiddleware)
 app.include_router(router)
-
-
-@app.middleware("http")
-async def security_headers_middleware(request: Request, call_next):
-    """SSA-002: Add security headers to every response."""
-    response: Response = await call_next(request)
-    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["X-Content-Type-Options"] = "nosniff"
-    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-    response.headers["Content-Security-Policy"] = "default-src 'self'"
-    response.headers["X-XSS-Protection"] = "0"
-    return response
 
 
 @app.get("/health")
