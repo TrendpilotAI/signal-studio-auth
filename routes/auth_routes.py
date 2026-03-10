@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr
 
 from config.redis_config import get_redis, REDIS_URL
 from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from middleware.rbac import _get_caller_role
 
 logger = logging.getLogger(__name__)
 
@@ -564,18 +565,6 @@ async def me(request: Request):
     if user is None or not user.is_authenticated:
         raise HTTPException(status_code=401, detail="Not authenticated")
     return user.model_dump(by_alias=True)
-
-
-def _get_caller_role(request: Request) -> str:
-    """
-    Extract the caller's role from the Supabase JWT claims attached by middleware.
-    Falls back to an empty string if claims are unavailable.
-    Role is stored in app_metadata.role within the JWT.
-    """
-    claims = getattr(request.state, "supabase_claims", None)
-    if claims:
-        return claims.get("app_metadata", {}).get("role", "")
-    return ""
 
 
 @router.post("/invite-to-org")
