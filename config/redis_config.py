@@ -29,7 +29,7 @@ def get_redis() -> Optional[redis.Redis]:
         return _redis_client if _redis_available else None
 
     if not REDIS_URL:
-        logger.info("REDIS_URL not set — using in-memory fallback for rate limiting and token store")
+        logger.warning("REDIS_URL not set — using in-memory fallback for rate limiting and token store")
         _redis_available = False
         return None
 

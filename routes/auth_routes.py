@@ -115,20 +115,28 @@ def _redis_or_memory_check(calls, lock, max_calls, window_seconds):
     """
     Return a check function that tries Redis first, falls back to in-memory.
     This enables cross-replica rate limiting when Redis is available.
+
+    RedisStorage and SlidingWindowRateLimiter are created *once* on the first
+    successful Redis hit and cached in the closure — not re-created per request.
     """
     _memory_check = _make_shim_check(calls, lock, max_calls, window_seconds)
+    _cached_storage = None
+    _cached_limiter = None
+    _cached_limit_item = None
 
     def _check(key: str) -> None:
+        nonlocal _cached_storage, _cached_limiter, _cached_limit_item
         r = get_redis()
         if r is not None:
             try:
-                from limits import parse as parse_limit
-                from limits.storage import RedisStorage
-                from limits.strategies import SlidingWindowRateLimiter
-                storage = RedisStorage(REDIS_URL)
-                limiter = SlidingWindowRateLimiter(storage)
-                limit_item = parse_limit(f"{max_calls} per {window_seconds} second")
-                if not limiter.hit(limit_item, "rl", key):
+                if _cached_limiter is None:
+                    from limits import parse as parse_limit
+                    from limits.storage import RedisStorage
+                    from limits.strategies import SlidingWindowRateLimiter
+                    _cached_storage = RedisStorage(REDIS_URL)
+                    _cached_limiter = SlidingWindowRateLimiter(_cached_storage)
+                    _cached_limit_item = parse_limit(f"{max_calls} per {window_seconds} second")
+                if not _cached_limiter.hit(_cached_limit_item, "rl", key):
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail=(

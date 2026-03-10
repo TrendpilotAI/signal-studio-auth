@@ -42,16 +42,27 @@ def _require_secret(env_var: str, fallback: str = "") -> str:
     return value
 
 
+def _require_env(var_name: str) -> str:
+    """Load a required env var. Raises RuntimeError at startup if missing (unless in testing)."""
+    value = os.environ.get(var_name, "")
+    if not _TESTING and not value:
+        raise RuntimeError(
+            f"[signal-studio-auth] FATAL: {var_name} is required but not set. "
+            f"Set this environment variable before starting the service."
+        )
+    return value
+
+
 class AuthMode(str, Enum):
     SUPABASE = "supabase"
     FORWARDLANE = "forwardlane"
     DUAL = "dual"
 
 
-# Supabase settings
-SUPABASE_URL: str = os.environ.get("SUPABASE_URL", "")
-SUPABASE_JWT_SECRET: str = os.environ.get("SUPABASE_JWT_SECRET", "")
-SUPABASE_SERVICE_KEY: str = os.environ.get("SUPABASE_SERVICE_KEY", "")
+# Supabase settings — fail fast at startup if critical vars are missing
+SUPABASE_URL: str = _require_env("SUPABASE_URL")
+SUPABASE_JWT_SECRET: str = _require_env("SUPABASE_JWT_SECRET")
+SUPABASE_SERVICE_KEY: str = _require_env("SUPABASE_SERVICE_KEY")
 SUPABASE_JWT_ALGORITHM: str = "HS256"
 SUPABASE_JWT_AUDIENCE: str = "authenticated"
 
