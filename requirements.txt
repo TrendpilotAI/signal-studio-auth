@@ -1,6 +1,7 @@
 # pinned 2026-03-08
 PyJWT==2.11.0
 email-validator==2.3.0
+fakeredis==2.32.0
 fastapi==0.135.1
 httpx==0.28.1
 limits==5.8.0
