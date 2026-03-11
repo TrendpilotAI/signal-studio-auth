@@ -94,33 +94,22 @@ class TestRateLimiterRedis:
     """Verify Redis-backed path is taken when Redis is available."""
 
     def test_redis_limiter_is_used_when_available(self):
-        """When Redis is reachable, the limits library should be used."""
+        """When Redis is reachable, _redis_or_memory_check returns a callable."""
         from collections import defaultdict
         from threading import Lock
         from routes.auth_routes import _redis_or_memory_check
 
         calls: dict = defaultdict(list)
         lock = Lock()
-        mock_redis = MagicMock()
-        mock_limiter = MagicMock()
-        mock_limiter.hit.return_value = True  # allow
-        mock_storage = MagicMock()
-
-        with patch("routes.auth_routes.get_redis", return_value=mock_redis), \
-             patch("config.redis_config.REDIS_URL", "redis://localhost:6379"):
-            with patch.dict("sys.modules", {
-                "limits": MagicMock(parse=MagicMock(return_value=MagicMock())),
-                "limits.storage": MagicMock(RedisStorage=MagicMock(return_value=mock_storage)),
-                "limits.strategies": MagicMock(SlidingWindowRateLimiter=MagicMock(return_value=mock_limiter)),
-            }):
-                check = _redis_or_memory_check(calls, lock, max_calls=5, window_seconds=60)
-                assert callable(check)
+        check = _redis_or_memory_check(calls, lock, max_calls=5, window_seconds=60)
+        assert callable(check)
 
     def test_redis_limiter_raises_429_when_limit_hit(self):
-        """When the Redis limiter returns False (limit hit), should raise 429."""
+        """When the module-level Redis limiter returns False (limit hit), should raise 429."""
         from collections import defaultdict
         from threading import Lock
         from fastapi import HTTPException
+        import routes.auth_routes as auth_module
         from routes.auth_routes import _redis_or_memory_check
 
         calls: dict = defaultdict(list)
@@ -128,19 +117,20 @@ class TestRateLimiterRedis:
         mock_redis = MagicMock()
         mock_limiter = MagicMock()
         mock_limiter.hit.return_value = False  # limit exceeded
-        mock_storage = MagicMock()
+        mock_limit_item = MagicMock()
+        mock_parse = MagicMock(return_value=mock_limit_item)
 
-        with patch("routes.auth_routes.get_redis", return_value=mock_redis):
-            with patch.dict("sys.modules", {
-                "limits": MagicMock(parse=MagicMock(return_value=MagicMock())),
-                "limits.storage": MagicMock(RedisStorage=MagicMock(return_value=mock_storage)),
-                "limits.strategies": MagicMock(SlidingWindowRateLimiter=MagicMock(return_value=mock_limiter)),
-            }):
-                check = _redis_or_memory_check(calls, lock, max_calls=5, window_seconds=60)
-                with pytest.raises(HTTPException) as exc_info:
-                    check("10.0.0.1")
-                assert exc_info.value.status_code == 429
-                assert "Retry-After" in exc_info.value.headers
+        # Patch the module-level instances instead of recreating per-request.
+        # This mirrors the fix for #828: instances live at module level.
+        with patch("routes.auth_routes.get_redis", return_value=mock_redis), \
+             patch.object(auth_module, "_redis_limiter_instance", mock_limiter), \
+             patch.object(auth_module, "_limits_available", True), \
+             patch.object(auth_module, "_parse_limit", mock_parse):
+            check = _redis_or_memory_check(calls, lock, max_calls=5, window_seconds=60)
+            with pytest.raises(HTTPException) as exc_info:
+                check("10.0.0.1")
+            assert exc_info.value.status_code == 429
+            assert "Retry-After" in exc_info.value.headers
 
 
 # ---------------------------------------------------------------------------

@@ -111,24 +111,48 @@ def _make_shim_check(calls, lock, max_calls, window_seconds):
     return _check
 
 
+# ---------------------------------------------------------------------------
+# Module-level Redis rate-limiter instances (created ONCE at import time).
+# Fixes #828: previously a new RedisStorage + SlidingWindowRateLimiter was
+# allocated on every request, which is a resource leak.
+# ---------------------------------------------------------------------------
+try:
+    from limits import parse as _parse_limit  # type: ignore[import]
+    from limits.storage import RedisStorage as _RedisStorage  # type: ignore[import]
+    from limits.strategies import SlidingWindowRateLimiter as _SlidingWindowRateLimiter  # type: ignore[import]
+    _redis_storage = _RedisStorage(REDIS_URL)
+    _redis_limiter_instance = _SlidingWindowRateLimiter(_redis_storage)
+    _limits_available: bool = True
+    logger.debug("Redis sliding-window rate limiter initialized (module level)")
+except Exception as _limits_exc:
+    _redis_storage = None
+    _redis_limiter_instance = None
+    _limits_available = False
+    logger.debug(
+        "limits library unavailable; Redis rate limiting disabled. Error: %s",
+        _limits_exc,
+    )
+
+
 def _redis_or_memory_check(calls, lock, max_calls, window_seconds):
     """
-    Return a check function that tries Redis first, falls back to in-memory.
-    This enables cross-replica rate limiting when Redis is available.
+    Return a check function that tries Redis-backed sliding-window limiting first,
+    then falls back to in-memory.  Module-level storage/limiter instances are reused
+    across every invocation — no per-request allocation.  Fixes #828.
     """
     _memory_check = _make_shim_check(calls, lock, max_calls, window_seconds)
+    # Pre-parse the limit descriptor once per limiter config, not per request.
+    _limit_item = (
+        _parse_limit(f"{max_calls} per {window_seconds} second")
+        if _limits_available
+        else None
+    )
 
     def _check(key: str) -> None:
         r = get_redis()
-        if r is not None:
+        if r is not None and _limits_available and _redis_limiter_instance is not None:
             try:
-                from limits import parse as parse_limit
-                from limits.storage import RedisStorage
-                from limits.strategies import SlidingWindowRateLimiter
-                storage = RedisStorage(REDIS_URL)
-                limiter = SlidingWindowRateLimiter(storage)
-                limit_item = parse_limit(f"{max_calls} per {window_seconds} second")
-                if not limiter.hit(limit_item, "rl", key):
+                if not _redis_limiter_instance.hit(_limit_item, "rl", key):
                     raise HTTPException(
                         status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                         detail=(

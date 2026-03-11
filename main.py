@@ -1,12 +1,15 @@
 """
 signal-studio-auth — FastAPI application entry point.
 
-Lifespan manages a shared httpx.AsyncClient connection pool (TODO-600).
+Lifespan manages a shared httpx.AsyncClient connection pool (TODO-600) and
+runs startup validation to fail fast when required env vars are absent (#834).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from contextlib import asynccontextmanager
 
 import httpx
@@ -17,15 +20,48 @@ from routes.auth_routes import router
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Required environment variables — checked at startup (#834).
+# ---------------------------------------------------------------------------
+_REQUIRED_ENV_VARS: list[str] = [
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_KEY",
+    "SUPABASE_JWT_SECRET",
+]
+
+
+def validate_required_env_vars() -> None:
+    """
+    Fail fast if any required environment variable is missing.
+
+    Checks SUPABASE_URL, SUPABASE_SERVICE_KEY, and SUPABASE_JWT_SECRET.
+    Skipped automatically during pytest runs so CI/CD test suites don't
+    need to supply production secrets.  Fixes #834.
+    """
+    is_testing = (
+        "pytest" in sys.modules
+        or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    )
+    if is_testing:
+        return
+
+    missing = [var for var in _REQUIRED_ENV_VARS if not os.environ.get(var)]
+    if missing:
+        raise RuntimeError(
+            f"[signal-studio-auth] FATAL: Missing required environment variables: "
+            f"{', '.join(missing)}. "
+            f"Set these variables before starting the service."
+        )
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
-    Startup: create a shared httpx.AsyncClient with connection pooling.
+    Startup: validate required env vars (#834), then create a shared
+    httpx.AsyncClient with connection pooling (TODO-600).
     Shutdown: gracefully close all connections.
-
-    TODO-600: replaces per-request httpx.AsyncClient creation (6+ TCP opens/request).
     """
+    validate_required_env_vars()
     logger.info("Starting up — creating shared httpx connection pool")
     app.state.http_client = httpx.AsyncClient(
         limits=httpx.Limits(
