@@ -8,5 +8,6 @@ pydantic[email]==2.12.5
 pytest==9.0.2
 pytest-asyncio==1.3.0
 pytest-cov==7.0.0
+fakeredis==2.34.1  # test dependency: in-memory Redis for unit tests
 redis==7.2.1
 uvicorn==0.41.0
