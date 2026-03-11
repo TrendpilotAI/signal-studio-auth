@@ -1,0 +1,115 @@
+# ---------------------------------------------------------------------------
+# signal-studio-auth — CI Pipeline (TODO-830)
+# Runs lint, type-check, tests (with coverage), and security scans on every
+# push and pull-request targeting the main/master branch.
+# ---------------------------------------------------------------------------
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ruff
+        run: pip install ruff
+
+      - name: Run ruff
+        run: ruff check .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt mypy types-redis
+
+      - name: Run mypy
+        run: mypy .
+
+  test:
+    name: Test (pytest + coverage)
+    runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pytest-cov
+
+      - name: Run pytest
+        env:
+          REDIS_URL: redis://localhost:6379/0
+          # Dummy secrets so config doesn't fail-fast during tests
+          SUPABASE_URL: https://test.supabase.co
+          SUPABASE_JWT_SECRET: test_jwt_secret_placeholder_32chars!!
+          SUPABASE_SERVICE_KEY: test_service_key_placeholder_32chars!
+          AUTH_SECRET_KEY: test_auth_secret_key_placeholder_32chars!
+          AUTH_MODE: dual
+        run: pytest --cov=. --cov-report=xml --cov-report=term-missing -v
+
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  security:
+    name: Security (bandit + pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install security tools
+        run: pip install bandit pip-audit
+
+      - name: Run bandit
+        run: bandit -r . -x ./tests,./migrations
+
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt

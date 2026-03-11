@@ -1,0 +1,59 @@
+# ---------------------------------------------------------------------------
+# signal-studio-auth — Project metadata and tooling config (TODO-830)
+# ---------------------------------------------------------------------------
+
+[project]
+name = "signal-studio-auth"
+version = "0.1.0"
+description = "Authentication proxy for Signal Studio, powered by Supabase."
+requires-python = ">=3.11"
+
+# ── Ruff ────────────────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line-length handled by formatter
+    "B008",  # do not perform function calls in argument defaults (FastAPI DI pattern)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["config", "middleware", "mapping", "models", "routes"]
+
+# ── Mypy ────────────────────────────────────────────────────────────────────
+[tool.mypy]
+python_version = "3.11"
+strict = false
+ignore_missing_imports = true
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+exclude = [
+    "migrations/",
+    "tests/",
+]
+
+# ── Pytest ──────────────────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-v"
+
+# ── Coverage ────────────────────────────────────────────────────────────────
+[tool.coverage.run]
+omit = [
+    "tests/*",
+    "migrations/*",
+    ".venv/*",
+]

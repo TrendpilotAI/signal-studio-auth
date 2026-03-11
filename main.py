@@ -7,10 +7,12 @@ Lifespan manages a shared httpx.AsyncClient connection pool (TODO-600).
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
 from middleware.security_headers import SecurityHeadersMiddleware
 from routes.auth_routes import router
@@ -47,6 +49,21 @@ app = FastAPI(
     description="Authentication proxy for Signal Studio, powered by Supabase.",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+# ---------------------------------------------------------------------------
+# CORS — TODO-826
+# Set CORS_ALLOWED_ORIGINS to a comma-separated list of allowed origins.
+# Example: CORS_ALLOWED_ORIGINS=https://app.example.com,https://admin.example.com
+# ---------------------------------------------------------------------------
+CORS_ORIGINS = [o.strip() for o in os.environ.get("CORS_ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
 
 app.add_middleware(SecurityHeadersMiddleware)
