@@ -31,6 +31,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 from config.redis_config import get_redis, REDIS_URL
 from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from middleware.rbac import _get_caller_role
+from middleware.trusted_proxy import get_real_client_ip
 
 logger = logging.getLogger(__name__)
 
@@ -180,11 +181,8 @@ _update_password_limiter = _LimiterShim(
 
 
 def _client_ip(request: Request) -> str:
-    """Extract real client IP (handles X-Forwarded-For from Railway/nginx)."""
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else "unknown"
+    """Extract real client IP using trusted-proxy validation (SSA-838)."""
+    return get_real_client_ip(request)
 
 
 # ---------------------------------------------------------------------------
