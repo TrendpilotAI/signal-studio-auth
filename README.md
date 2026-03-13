@@ -106,25 +106,46 @@ Current policy:
 - `Permissions-Policy: camera=(), microphone=(), geolocation=(), interest-cohort=()`
 - `X-XSS-Protection: 1; mode=block`
 
-## Environment variables
+## Environment setup
+
+Copy `.env.example` to `.env` and fill in the values:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` with your real values. Never commit a populated `.env` file.
 
 ### Required in non-test environments
-- `SUPABASE_URL` — Supabase project URL
-- `SUPABASE_JWT_SECRET` — JWT secret from Supabase project settings
-- `SUPABASE_SERVICE_KEY` — Supabase service role key
-- `AUTH_SECRET_KEY` — strong secret for legacy/dual auth mode checks; must not be weak/default and must be at least 32 chars
+
+| Variable | Description |
+|---|---|
+| `SUPABASE_URL` | Supabase project URL (Settings → API → Project URL) |
+| `SUPABASE_JWT_SECRET` | JWT secret for verifying Supabase-issued access tokens (Settings → API → JWT Secret) |
+| `SUPABASE_SERVICE_KEY` | Service role key for admin operations — **keep server-side only** |
+| `AUTH_SECRET_KEY` | Strong secret (≥ 32 chars) for legacy/dual auth mode; also referred to as `JWT_SECRET` in related services |
+
+Generate a strong `AUTH_SECRET_KEY`:
+```bash
+python -c "import secrets; print(secrets.token_hex(32))"
+```
 
 ### Optional
-- `REDIS_URL` — Redis connection string; if omitted, the app falls back to in-memory mode
-- `AUTH_MODE` — `supabase`, `forwardlane`, or `dual` (defaults to `dual`)
-- `FORWARDLANE_API_URL` — legacy ForwardLane API base URL (defaults to `http://0.0.0.0:8000`)
 
-### Example
+| Variable | Default | Description |
+|---|---|---|
+| `REDIS_URL` | _(none)_ | Redis connection URL. If unset, falls back to in-memory storage (not safe for multi-replica deployments) |
+| `CORS_ORIGINS` | _(none)_ | Comma-separated list of allowed CORS origins, e.g. `https://app.example.com` |
+| `AUTH_MODE` | `dual` | Auth backend: `supabase`, `forwardlane`, or `dual` |
+| `FORWARDLANE_API_URL` | `http://0.0.0.0:8000` | Legacy ForwardLane API base URL (only needed in `dual`/`forwardlane` mode) |
+
+### Quick-start example
+
 ```bash
-export SUPABASE_URL="https://your-project.supabase.co"
-export SUPABASE_JWT_SECRET="replace-with-the-project-jwt-secret"
-export SUPABASE_SERVICE_KEY="replace-with-the-service-role-key"
-export AUTH_SECRET_KEY="replace-with-a-random-32+-char-secret"
+export SUPABASE_URL="https://your-project-ref.supabase.co"
+export SUPABASE_JWT_SECRET="your-supabase-jwt-secret"
+export SUPABASE_SERVICE_KEY="your-service-role-key"
+export AUTH_SECRET_KEY="$(python -c "import secrets; print(secrets.token_hex(32))")"
 export REDIS_URL="redis://localhost:6379/0"
 export AUTH_MODE="supabase"
 ```
