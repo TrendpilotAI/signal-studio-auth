@@ -500,3 +500,75 @@ class TestRateLimiting:
                 )
 
         assert resp.status_code == 200, f"Different IP should not be rate-limited, got {resp.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# TestRevokeAllUserTokens
+# ---------------------------------------------------------------------------
+
+class TestRevokeAllUserTokens:
+    """
+    Security fix: password change must revoke ALL opaque refresh tokens.
+
+    Verifies that _revoke_all_user_tokens() deletes every rt:{token_id} hash
+    for the given user, removes their entries from family SETs, and clears the
+    user:tokens:{user_id} index.
+    """
+
+    def test_revoke_all_tokens_clears_user_index(self):
+        """After revocation, all token hashes and the user index should be gone."""
+        from routes.auth_routes import _issue_family_token, _revoke_all_user_tokens, USER_TOKENS_PREFIX
+
+        redis = _fake_redis()
+        user_id = "user-abc-123"
+
+        # Issue three tokens for the same user
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            t1 = _issue_family_token("sb_tok_1", user_id=user_id)
+            t2 = _issue_family_token("sb_tok_2", user_id=user_id)
+            t3 = _issue_family_token("sb_tok_3", user_id=user_id)
+
+        # Confirm they exist in Redis
+        assert redis.hget(f"rt:{t1}", "user_id") == user_id
+        assert redis.hget(f"rt:{t2}", "user_id") == user_id
+        assert redis.hget(f"rt:{t3}", "user_id") == user_id
+        assert redis.sismember(f"{USER_TOKENS_PREFIX}{user_id}", t1)
+
+        # Revoke all
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            count = _revoke_all_user_tokens(user_id)
+
+        assert count == 3
+        # All token hashes gone
+        assert not redis.exists(f"rt:{t1}")
+        assert not redis.exists(f"rt:{t2}")
+        assert not redis.exists(f"rt:{t3}")
+        # User index gone
+        assert not redis.exists(f"{USER_TOKENS_PREFIX}{user_id}")
+
+    def test_tokens_of_other_users_untouched(self):
+        """Revoking one user's tokens must not affect another user's tokens."""
+        from routes.auth_routes import _issue_family_token, _revoke_all_user_tokens
+
+        redis = _fake_redis()
+        user_a = "user-aaa"
+        user_b = "user-bbb"
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            ta = _issue_family_token("sb_tok_a", user_id=user_a)
+            tb = _issue_family_token("sb_tok_b", user_id=user_b)
+            _revoke_all_user_tokens(user_a)
+
+        # user_a's token gone
+        assert not redis.exists(f"rt:{ta}")
+        # user_b's token still intact
+        assert redis.hget(f"rt:{tb}", "user_id") == user_b
+
+    def test_revoke_returns_zero_when_no_redis(self):
+        """No Redis → graceful no-op, returns 0."""
+        from routes.auth_routes import _revoke_all_user_tokens
+
+        with patch("routes.auth_routes.get_redis", return_value=None):
+            count = _revoke_all_user_tokens("any-user")
+
+        assert count == 0

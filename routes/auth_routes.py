@@ -199,6 +199,9 @@ def _client_ip(request: Request) -> str:
 # detection).  The family SET is used to enumerate all tokens to delete.
 # ---------------------------------------------------------------------------
 
+USER_TOKENS_PREFIX = "user:tokens:"  # user:{user_id}:tokens SET key prefix
+
+
 def _issue_family_token(supabase_token: str,
                         user_id: str = "",
                         parent_id: str = "",
@@ -209,6 +212,9 @@ def _issue_family_token(supabase_token: str,
     Creates a new family when family_id is None (initial login / signup).
     Returns the new opaque token_id.  Falls back to a plain UUID if Redis
     is unavailable (no persistence — Supabase handles session revocation).
+
+    Maintains a user→tokens index at ``user:tokens:{user_id}`` so that
+    all tokens for a user can be efficiently revoked (e.g. on password change).
     """
     token_id = str(uuid.uuid4())
     fid = family_id or str(uuid.uuid4())
@@ -228,6 +234,11 @@ def _issue_family_token(supabase_token: str,
     pipe.expire(f"rt:{token_id}", REFRESH_TOKEN_TTL)
     pipe.sadd(f"rt:family:{fid}", token_id)
     pipe.expire(f"rt:family:{fid}", REFRESH_TOKEN_TTL)
+    # Track token under the user's token set for efficient bulk revocation
+    if user_id:
+        user_tokens_key = f"{USER_TOKENS_PREFIX}{user_id}"
+        pipe.sadd(user_tokens_key, token_id)
+        pipe.expire(user_tokens_key, REFRESH_TOKEN_TTL)
     pipe.execute()
     return token_id
 
@@ -291,7 +302,7 @@ def _rotate_family_token(old_token_id: str, new_supabase_token: str) -> str:
 def _revoke_opaque_token(opaque_token: str) -> bool:
     """
     Delete an opaque token from Redis (logout / revocation).
-    Also removes the token from its family SET to keep it tidy.
+    Also removes the token from its family SET and user index to keep them tidy.
     Returns True if the token existed, False otherwise.
     """
     r = get_redis()
@@ -307,8 +318,48 @@ def _revoke_opaque_token(opaque_token: str) -> bool:
     family_id = data.get("family_id", "") if data else ""
     if family_id:
         pipe.srem(f"rt:family:{family_id}", opaque_token)
+    user_id = data.get("user_id", "") if data else ""
+    if user_id:
+        pipe.srem(f"{USER_TOKENS_PREFIX}{user_id}", opaque_token)
     pipe.execute()
     return existed
+
+
+def _revoke_all_user_tokens(user_id: str) -> int:
+    """
+    Revoke ALL opaque refresh tokens for a user (called on password change).
+
+    Uses the ``user:tokens:{user_id}`` index to find all token IDs, then
+    deletes each token hash, its family SET membership, and the index itself.
+
+    Returns the number of tokens revoked.
+    """
+    r = get_redis()
+    if r is None or not user_id:
+        return 0
+
+    user_tokens_key = f"{USER_TOKENS_PREFIX}{user_id}"
+    token_ids = r.smembers(user_tokens_key)
+    if not token_ids:
+        return 0
+
+    pipe = r.pipeline()
+    for token_id in token_ids:
+        token_key = f"rt:{token_id}"
+        data = r.hgetall(token_key)
+        if data:
+            family_id = data.get("family_id", "")
+            if family_id:
+                pipe.srem(f"rt:family:{family_id}", token_id)
+        pipe.delete(token_key)
+    pipe.delete(user_tokens_key)
+    pipe.execute()
+
+    logger.info(
+        "_revoke_all_user_tokens: revoked %d token(s) for user %s",
+        len(token_ids), user_id,
+    )
+    return len(token_ids)
 
 
 def _wrap_with_opaque_token(supabase_response: dict, user_id: str = "") -> dict:
@@ -687,12 +738,17 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
     if resp.status_code >= 400:
         raise HTTPException(status_code=400, detail="Password update failed")
 
-    # Revoke all existing opaque refresh tokens for this user in Redis
-    # We do a best-effort scan; if Redis is unavailable this is a no-op.
+    # Revoke all existing opaque refresh tokens for this user in Redis.
+    # _revoke_all_user_tokens uses the user:tokens:{user_id} index for an
+    # O(n) bulk delete — no expensive SCAN needed.
     try:
-        r = get_redis()
-        if r is not None and user_sub:
-            # Also force Supabase to invalidate all sessions via admin API
+        if user_sub:
+            revoked = _revoke_all_user_tokens(user_sub)
+            logger.info(
+                "update_password: revoked %d opaque token(s) for user %s",
+                revoked, user_sub,
+            )
+            # Also force Supabase to invalidate all server-side sessions
             async with _http_client(request) as client:
                 await client.post(
                     f"{SUPABASE_URL}/auth/v1/admin/users/{user_sub}/logout",
