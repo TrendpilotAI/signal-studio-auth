@@ -17,6 +17,7 @@ Refresh token rotation (TODO-403):
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict
@@ -168,6 +169,8 @@ _reset_password_calls: dict[str, list[float]] = defaultdict(list)
 _update_password_calls: dict[str, list[float]] = defaultdict(list)
 _reset_password_lock = Lock()
 _update_password_lock = Lock()
+_refresh_lock = Lock()
+_logout_lock = Lock()
 
 _reset_password_limiter = _LimiterShim(
     _redis_or_memory_check(_reset_password_calls, _reset_password_lock, max_calls=3, window_seconds=3600),
@@ -178,12 +181,61 @@ _update_password_limiter = _LimiterShim(
     _update_password_calls,
 )
 
+# Rate limiters for refresh and logout endpoints
+_refresh_calls: dict[str, list[float]] = defaultdict(list)
+_logout_calls: dict[str, list[float]] = defaultdict(list)
+
+_refresh_limiter = _LimiterShim(
+    _redis_or_memory_check(_refresh_calls, _refresh_lock, max_calls=10, window_seconds=60),
+    _refresh_calls,
+)
+_logout_limiter = _LimiterShim(
+    _redis_or_memory_check(_logout_calls, _logout_lock, max_calls=10, window_seconds=60),
+    _logout_calls,
+)
+
 
 def _client_ip(request: Request) -> str:
-    """Extract real client IP (handles X-Forwarded-For from Railway/nginx)."""
+    """Extract real client IP (handles X-Forwarded-For from Railway/nginx).
+    
+    SECURITY FIX: To prevent X-Forwarded-For spoofing attacks:
+    1. Prefer X-Real-IP header (set by trusted proxy like Railway/nginx)
+    2. For X-Forwarded-For, use rightmost IP after skipping trusted proxies
+    
+    Railway adds one proxy hop. Set TRUSTED_PROXY_DEPTH=1 (default) to trust Railway.
+    Set TRUSTED_PROXY_DEPTH=0 if running without a reverse proxy.
+    """
+    # 1. Prefer X-Real-IP header - set by trusted reverse proxy
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    
+    # 2. Fall back to X-Forwarded-For with security fix
     forwarded_for = request.headers.get("X-Forwarded-For")
     if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
+        # Split comma-separated chain: client, proxy1, proxy2, ...
+        ips = [ip.strip() for ip in forwarded_for.split(",") if ip.strip()]
+        
+        if not ips:
+            return request.client.host if request.client else "unknown"
+        
+        # Determine how many rightmost proxies we trust (default: 1 for Railway)
+        try:
+            trusted_depth = int(os.getenv("TRUSTED_PROXY_DEPTH", "1"))
+        except ValueError:
+            trusted_depth = 1
+        
+        # Skip trusted_depth proxies from the right
+        # Example: X-Forwarded-For: client, proxy1, proxy2
+        # With trusted_depth=1 (trust proxy2), client_ip = proxy1
+        # With trusted_depth=2 (trust proxy2 & proxy1), client_ip = client
+        if len(ips) > trusted_depth:
+            return ips[-trusted_depth - 1]
+        else:
+            # Not enough IPs in chain - all are trusted proxies
+            # Fall back to direct connection IP
+            return request.client.host if request.client else "unknown"
+    
     return request.client.host if request.client else "unknown"
 
 
@@ -331,6 +383,9 @@ def _revoke_all_user_tokens(user_id: str) -> int:
 
     Uses the ``user:tokens:{user_id}`` index to find all token IDs, then
     deletes each token hash, its family SET membership, and the index itself.
+    
+    As a safety fallback, also performs a Redis SCAN for any rt:* keys
+    that have this user_id in their hash data (in case index is incomplete).
 
     Returns the number of tokens revoked.
     """
@@ -338,28 +393,68 @@ def _revoke_all_user_tokens(user_id: str) -> int:
     if r is None or not user_id:
         return 0
 
+    revoked_count = 0
+    
+    # Method 1: Use the user:tokens index (primary, efficient)
     user_tokens_key = f"{USER_TOKENS_PREFIX}{user_id}"
     token_ids = r.smembers(user_tokens_key)
-    if not token_ids:
-        return 0
-
-    pipe = r.pipeline()
-    for token_id in token_ids:
-        token_key = f"rt:{token_id}"
-        data = r.hgetall(token_key)
-        if data:
-            family_id = data.get("family_id", "")
-            if family_id:
-                pipe.srem(f"rt:family:{family_id}", token_id)
-        pipe.delete(token_key)
-    pipe.delete(user_tokens_key)
-    pipe.execute()
-
-    logger.info(
-        "_revoke_all_user_tokens: revoked %d token(s) for user %s",
-        len(token_ids), user_id,
-    )
-    return len(token_ids)
+    
+    if token_ids:
+        pipe = r.pipeline()
+        for token_id in token_ids:
+            token_key = f"rt:{token_id}"
+            data = r.hgetall(token_key)
+            if data:
+                family_id = data.get("family_id", "")
+                if family_id:
+                    pipe.srem(f"rt:family:{family_id}", token_id)
+            pipe.delete(token_key)
+        pipe.delete(user_tokens_key)
+        pipe.execute()
+        revoked_count = len(token_ids)
+        logger.info(
+            "_revoke_all_user_tokens: revoked %d token(s) for user %s via index",
+            revoked_count, user_id,
+        )
+    
+    # Method 2: Safety SCAN for any remaining tokens (belt-and-suspenders)
+    # This handles edge cases where tokens might not be in the index
+    try:
+        scan_count = 0
+        cursor = "0"
+        pattern = "rt:*"
+        
+        while True:
+            cursor, keys = r.scan(cursor=cursor, match=pattern, count=100)
+            if keys:
+                pipe = r.pipeline()
+                for key in keys:
+                    # Check if this token belongs to our user
+                    user_id_in_token = r.hget(key, "user_id")
+                    if user_id_in_token and user_id_in_token.decode('utf-8') == user_id:
+                        # Get family_id before deleting
+                        family_id = r.hget(key, "family_id")
+                        if family_id:
+                            pipe.srem(f"rt:family:{family_id.decode('utf-8')}", key[3:])  # Remove "rt:" prefix
+                        pipe.delete(key)
+                        scan_count += 1
+                pipe.execute()
+            
+            if cursor == "0":
+                break
+        
+        if scan_count > 0:
+            logger.info(
+                "_revoke_all_user_tokens: SCAN found and revoked %d additional token(s) for user %s",
+                scan_count, user_id,
+            )
+            revoked_count += scan_count
+            
+    except Exception as exc:
+        logger.warning("_revoke_all_user_tokens: SCAN fallback failed: %s", exc)
+        # Don't raise - primary method already did its job
+    
+    return revoked_count
 
 
 def _wrap_with_opaque_token(supabase_response: dict, user_id: str = "") -> dict:
@@ -529,7 +624,10 @@ async def refresh(body: RefreshRequest, request: Request):
        _rotate_family_token() — which handles theft detection — without hitting Supabase.
     2. Call Supabase to exchange the token.
     3. Call _rotate_family_token() to mark the old token consumed and issue a child token.
+    
+    Rate limit: 10 requests per IP per 60 seconds.
     """
+    _refresh_limiter.check(_client_ip(request))
     old_token_id = body.refresh_token.strip()
 
     r = get_redis()
@@ -575,7 +673,10 @@ async def logout(request: Request, body: LogoutRequest | None = None):
     Sign out: revoke opaque refresh token from Redis and invalidate Supabase session.
     The opaque refresh_token can be passed in the request body OR the Authorization
     header is used to call Supabase logout.
+    
+    Rate limit: 10 requests per IP per 60 seconds.
     """
+    _logout_limiter.check(_client_ip(request))
     # Revoke opaque token if provided
     if body and body.refresh_token:
         _revoke_opaque_token(body.refresh_token.strip())

@@ -1,0 +1,35 @@
+# docker-compose.yml for local development
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  auth-service:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - TRUSTED_PROXY_DEPTH=1
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - .:/home/appuser
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+volumes:
+  redis_data:
