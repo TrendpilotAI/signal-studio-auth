@@ -170,26 +170,24 @@ class TestRateLimiting:
     def test_rate_limit_response_has_retry_after_header(self):
         """429 response must include Retry-After header."""
         from routes.auth_routes import _login_limiter
+        import time
 
-        # Exhaust the limit for a specific IP
         fake_ip = "10.0.0.42"
-        for _ in range(5):
-            _login_limiter._calls[fake_ip].append(__import__("time").monotonic())
 
         app = _make_test_app()
-        # Re-add the exhausted state (make_test_app clears it)
         from routes.auth_routes import _login_limiter as lim
-        import time
+        # Pre-load rate limit state for fake_ip
         for _ in range(5):
             lim._calls[fake_ip].append(time.monotonic())
 
         client = TestClient(app, raise_server_exceptions=False)
-        resp = client.post(
-            "/auth/login",
-            json={"email": "x@y.com", "password": "p"},
-            headers={"X-Forwarded-For": fake_ip},
-        )
-        assert resp.status_code == 429
+        # Patch get_real_client_ip so the rate limiter sees fake_ip regardless of TestClient peer
+        with patch("routes.auth_routes.get_real_client_ip", return_value=fake_ip):
+            resp = client.post(
+                "/auth/login",
+                json={"email": "x@y.com", "password": "p"},
+            )
+        assert resp.status_code == 429, f"Expected 429, got {resp.status_code}"
         assert "Retry-After" in resp.headers
 
     def test_different_ips_have_independent_limits(self):
@@ -218,21 +216,21 @@ class TestRateLimiting:
             instance.post = _mock_post
             MockClient.return_value = instance
 
-            # IP A is exhausted
-            resp_a = client.post(
-                "/auth/login",
-                json={"email": "a@a.com", "password": "pw"},
-                headers={"X-Forwarded-For": "1.2.3.4"},
-            )
-            # IP B is fresh
-            resp_b = client.post(
-                "/auth/login",
-                json={"email": "b@b.com", "password": "pw"},
-                headers={"X-Forwarded-For": "5.6.7.8"},
-            )
+            # IP A is exhausted — patch get_real_client_ip to return IP A
+            with patch("routes.auth_routes.get_real_client_ip", return_value="1.2.3.4"):
+                resp_a = client.post(
+                    "/auth/login",
+                    json={"email": "a@a.com", "password": "pw"},
+                )
+            # IP B is fresh — patch get_real_client_ip to return IP B
+            with patch("routes.auth_routes.get_real_client_ip", return_value="5.6.7.8"):
+                resp_b = client.post(
+                    "/auth/login",
+                    json={"email": "b@b.com", "password": "pw"},
+                )
 
-        assert resp_a.status_code == 429
-        assert resp_b.status_code != 429
+        assert resp_a.status_code == 429, f"Expected 429 for exhausted IP, got {resp_a.status_code}"
+        assert resp_b.status_code != 429, f"Expected non-429 for fresh IP, got {resp_b.status_code}"
 
 
 # ---------------------------------------------------------------------------

@@ -484,19 +484,19 @@ class TestRateLimiting:
 
         with patch("routes.auth_routes.get_redis", return_value=None):
             with patch("httpx.AsyncClient", self._supabase_ok_mock()):
-                # Exhaust IP 1
-                for _ in range(5):
-                    client.post(
-                        "/auth/login",
-                        json={"email": "a@example.com", "password": "p"},
-                        headers={"X-Forwarded-For": "1.1.1.1"},
-                    )
+                # Exhaust IP 1 — patch get_real_client_ip so TestClient peer is treated as "1.1.1.1"
+                with patch("routes.auth_routes.get_real_client_ip", return_value="1.1.1.1"):
+                    for _ in range(5):
+                        client.post(
+                            "/auth/login",
+                            json={"email": "a@example.com", "password": "p"},
+                        )
 
-                # IP 2 should still have full budget
-                resp = client.post(
-                    "/auth/login",
-                    json={"email": "b@example.com", "password": "p"},
-                    headers={"X-Forwarded-For": "2.2.2.2"},
-                )
+                # IP 2 should still have full budget — patch as "2.2.2.2"
+                with patch("routes.auth_routes.get_real_client_ip", return_value="2.2.2.2"):
+                    resp = client.post(
+                        "/auth/login",
+                        json={"email": "b@example.com", "password": "p"},
+                    )
 
         assert resp.status_code == 200, f"Different IP should not be rate-limited, got {resp.status_code}"
