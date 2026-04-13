@@ -12,8 +12,12 @@ from contextlib import asynccontextmanager
 import httpx
 from fastapi import FastAPI
 
+from config.logging_config import setup_structured_logging
 from middleware.security_headers import SecurityHeadersMiddleware
 from routes.auth_routes import router
+
+# Initialize structured JSON logging at module load
+setup_structured_logging()
 
 logger = logging.getLogger(__name__)
 

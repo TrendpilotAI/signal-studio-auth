@@ -30,6 +30,7 @@ from pydantic import BaseModel, ConfigDict, EmailStr, field_validator
 
 from config.redis_config import get_redis, REDIS_URL
 from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
+from config.logging_config import auth_log
 from middleware.rbac import _get_caller_role
 from middleware.trusted_proxy import get_real_client_ip
 
@@ -447,8 +448,13 @@ async def signup(body: SignupRequest, request: Request):
             },
         )
     if resp.status_code >= 400:
+        auth_log("signup_failed", email=body.email, ip=_client_ip(request),
+                 status_code=resp.status_code, level=logging.WARNING)
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
-    return _wrap_with_opaque_token(resp.json())
+    result = _wrap_with_opaque_token(resp.json())
+    auth_log("signup_success", email=body.email, ip=_client_ip(request),
+             user_id=(resp.json().get("user", {}) or {}).get("id", ""))
+    return result
 
 
 @router.post("/login")
@@ -462,8 +468,13 @@ async def login(body: LoginRequest, request: Request):
             json={"email": body.email, "password": body.password},
         )
     if resp.status_code >= 400:
+        auth_log("login_failed", email=body.email, ip=_client_ip(request),
+                 status_code=resp.status_code, level=logging.WARNING)
         raise HTTPException(status_code=resp.status_code, detail=resp.json())
-    return _wrap_with_opaque_token(resp.json())
+    result = _wrap_with_opaque_token(resp.json())
+    auth_log("login_success", email=body.email, ip=_client_ip(request),
+             user_id=(resp.json().get("user", {}) or {}).get("id", ""))
+    return result
 
 
 @router.post("/refresh")
@@ -483,6 +494,8 @@ async def refresh(body: RefreshRequest, request: Request):
     if r is not None:
         token_data = r.hgetall(f"rt:{old_token_id}")
         if not token_data:
+            auth_log("token_refresh_invalid", ip=_client_ip(request),
+                     detail="expired_or_missing", level=logging.WARNING)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid or expired refresh token",
@@ -490,6 +503,8 @@ async def refresh(body: RefreshRequest, request: Request):
         # If already consumed, delegate to _rotate_family_token immediately —
         # it detects the theft, revokes the family, and raises 401. No Supabase call needed.
         if token_data.get("consumed") == "1":
+            auth_log("token_refresh_reuse_detected", ip=_client_ip(request),
+                     token_family=token_data.get("family_id", ""), level=logging.WARNING)
             _rotate_family_token(old_token_id, "")  # always raises HTTP 401
         supabase_refresh = token_data["supabase_token"]
     else:
@@ -513,6 +528,8 @@ async def refresh(body: RefreshRequest, request: Request):
 
     result = dict(supabase_data)
     result["refresh_token"] = new_token_id
+    auth_log("token_refresh_success", ip=_client_ip(request),
+             user_id=(supabase_data.get("user", {}) or {}).get("id", ""))
     return result
 
 
@@ -539,6 +556,7 @@ async def logout(request: Request, body: LogoutRequest | None = None):
         except Exception as exc:
             logger.warning("Supabase logout call failed: %s", exc)
 
+    auth_log("logout", ip=_client_ip(request))
     return {"detail": "Logged out"}
 
 
