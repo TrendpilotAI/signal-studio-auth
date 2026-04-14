@@ -310,6 +310,42 @@ def _revoke_opaque_token(opaque_token: str) -> bool:
     return existed
 
 
+def _revoke_all_user_tokens(user_id: str) -> int:
+    """
+    Scan Redis for all opaque refresh tokens belonging to *user_id* and delete them.
+
+    Uses SCAN to iterate ``rt:*`` keys and checks the ``user_id`` field in each hash.
+    Returns the number of tokens revoked.  Best-effort: returns 0 if Redis is unavailable.
+
+    This is called on password change (#837) and admin session revocation (#836).
+    """
+    r = get_redis()
+    if r is None or not user_id:
+        return 0
+
+    revoked = 0
+    cursor = "0"
+    while True:
+        cursor, keys = r.scan(cursor=cursor, match="rt:*", count=200)
+        # Filter out family keys (rt:family:*)
+        token_keys = [k for k in keys if not k.startswith("rt:family:")]
+        for key in token_keys:
+            token_data = r.hgetall(key)
+            if token_data.get("user_id") == user_id:
+                family_id = token_data.get("family_id", "")
+                pipe = r.pipeline()
+                pipe.delete(key)
+                if family_id:
+                    token_id = key[len("rt:"):]  # strip prefix
+                    pipe.srem(f"rt:family:{family_id}", token_id)
+                pipe.execute()
+                revoked += 1
+        if cursor == "0" or cursor == 0:
+            break
+
+    return revoked
+
+
 def _wrap_with_opaque_token(supabase_response: dict, user_id: str = "") -> dict:
     """
     Replace the Supabase refresh_token in the response with an opaque family token.
@@ -703,11 +739,11 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
     if resp.status_code >= 400:
         raise HTTPException(status_code=400, detail="Password update failed")
 
-    # Revoke all existing opaque refresh tokens for this user in Redis
-    # We do a best-effort scan; if Redis is unavailable this is a no-op.
+    # Revoke all existing opaque refresh tokens for this user in Redis (#837)
+    revoked_count = 0
     try:
-        r = get_redis()
-        if r is not None and user_sub:
+        if user_sub:
+            revoked_count = _revoke_all_user_tokens(user_sub)
             # Also force Supabase to invalidate all sessions via admin API
             async with _http_client(request) as client:
                 await client.post(
@@ -717,5 +753,68 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
     except Exception as exc:  # noqa: BLE001
         logger.warning("update_password: session revocation failed: %s", exc)
 
-    logger.info("update_password: password changed for user %s", user_sub or "unknown")
+    logger.info(
+        "update_password: password changed for user %s, revoked %d sessions",
+        user_sub or "unknown", revoked_count,
+    )
     return {"message": "Password updated successfully"}
+
+
+# ---------------------------------------------------------------------------
+# Admin endpoints
+# ---------------------------------------------------------------------------
+
+@router.delete("/admin/users/{user_id}/sessions")
+async def admin_revoke_user_sessions(user_id: str, request: Request):
+    """
+    Admin-only: revoke all sessions for a given user (#836).
+
+    1. Revokes all opaque refresh tokens in Redis for the target user.
+    2. Calls Supabase admin API to invalidate all server-side sessions.
+
+    Requires the caller to be authenticated with the 'admin' role.
+    """
+    # Verify caller is authenticated
+    caller = getattr(request.state, "user", None)
+    if not caller or not caller.is_authenticated:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+        )
+
+    # Verify caller has admin role
+    caller_role = _get_caller_role(request)
+    if caller_role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required to revoke user sessions",
+        )
+
+    # Revoke all opaque refresh tokens in Redis
+    revoked_count = _revoke_all_user_tokens(user_id)
+
+    # Also invalidate sessions on Supabase side
+    try:
+        async with _http_client(request) as client:
+            resp = await client.post(
+                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}/logout",
+                headers=_supabase_headers(service=True),
+            )
+            if resp.status_code >= 400:
+                logger.warning(
+                    "admin_revoke_sessions: Supabase logout failed for user %s: %s",
+                    user_id, resp.status_code,
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("admin_revoke_sessions: Supabase call failed: %s", exc)
+
+    auth_log(
+        "admin_revoke_sessions",
+        target_user_id=user_id,
+        revoked_tokens=revoked_count,
+        ip=_client_ip(request),
+    )
+    return {
+        "detail": f"All sessions revoked for user {user_id}",
+        "revoked_tokens": revoked_count,
+    }

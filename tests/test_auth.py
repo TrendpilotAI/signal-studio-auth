@@ -133,7 +133,7 @@ class TestJWTVerification:
     def test_wrong_secret_raises(self):
         token = _make_supabase_jwt()
         with pytest.raises(pyjwt.InvalidSignatureError):
-            pyjwt.decode(token, "wrong-secret", algorithms=["HS256"], audience="authenticated")
+            pyjwt.decode(token, "wrong-secret-but-at-least-32-bytes!!", algorithms=["HS256"], audience="authenticated")
 
 
 # ---------------------------------------------------------------------------
