@@ -385,6 +385,119 @@ class TestUpdatePassword:
 # Rate limiting tests for new routes
 # ---------------------------------------------------------------------------
 
+class TestUpdatePasswordRevokesRefreshTokens:
+    """
+    CRIT-5 (AUDIT Finding #5): after a successful password change, all of the
+    user's outstanding opaque refresh tokens must be revoked in Redis so a
+    stolen refresh token cannot outlive the password reset.
+    """
+
+    def setup_method(self):
+        _update_password_calls.clear()
+
+    def test_stolen_refresh_token_revoked_after_password_change(self):
+        """A token belonging to the user must be deleted; other users' tokens must survive."""
+        import fakeredis
+        import uuid as uuid_mod
+
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        user_sub = "user-uuid-1234"  # matches _make_jwt() default sub
+
+        stolen_token = str(uuid_mod.uuid4())
+        family_id = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{stolen_token}", mapping={
+            "user_id": user_sub,
+            "family_id": family_id,
+            "parent_id": "",
+            "supabase_token": "supabase-rt-stolen",
+            "consumed": "0",
+        })
+        redis.sadd(f"rt:family:{family_id}", stolen_token)
+
+        # A second token in the same family must also be revoked.
+        sibling_token = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{sibling_token}", mapping={
+            "user_id": user_sub,
+            "family_id": family_id,
+            "parent_id": stolen_token,
+            "supabase_token": "supabase-rt-sibling",
+            "consumed": "0",
+        })
+        redis.sadd(f"rt:family:{family_id}", sibling_token)
+
+        # A token belonging to a DIFFERENT user must survive untouched.
+        other_token = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{other_token}", mapping={
+            "user_id": "some-other-user",
+            "family_id": "other-family",
+            "parent_id": "",
+            "supabase_token": "supabase-rt-other",
+            "consumed": "0",
+        })
+        redis.sadd("rt:family:other-family", other_token)
+
+        app = _make_app(authenticated=True)
+        token = _make_jwt(sub=user_sub)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value={"id": user_sub})
+
+        mock_client = AsyncMock()
+        mock_client.put = AsyncMock(return_value=mock_resp)
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+                MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/auth/update-password",
+                    json={"new_password": "SuperSecret99"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+
+        # The stolen token and its family sibling must be gone.
+        assert redis.hgetall(f"rt:{stolen_token}") == {}
+        assert redis.hgetall(f"rt:{sibling_token}") == {}
+        assert redis.smembers(f"rt:family:{family_id}") == set()
+
+        # Another user's token must be untouched.
+        assert redis.hgetall(f"rt:{other_token}").get("supabase_token") == "supabase-rt-other"
+        assert other_token in redis.smembers("rt:family:other-family")
+
+    def test_no_redis_is_a_safe_no_op(self):
+        """When Redis is unavailable, password update should still succeed (best-effort)."""
+        app = _make_app(authenticated=True)
+        token = _make_jwt()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value={"id": "user-uuid-1234"})
+
+        mock_client = AsyncMock()
+        mock_client.put = AsyncMock(return_value=mock_resp)
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+
+        with patch("routes.auth_routes.get_redis", return_value=None):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+                MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/auth/update-password",
+                    json={"new_password": "SuperSecret99"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+
+
 class TestPasswordResetRateLimit:
 
     def setup_method(self):

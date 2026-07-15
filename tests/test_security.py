@@ -171,8 +171,15 @@ class TestRateLimiting:
         """429 response must include Retry-After header."""
         from routes.auth_routes import _login_limiter
 
-        # Exhaust the limit for a specific IP
-        fake_ip = "10.0.0.42"
+        # Exhaust the limit for a specific (public) IP. NOTE: the SSA-838
+        # trusted-proxy change (middleware/trusted_proxy.py) only honors
+        # X-Forwarded-For when the direct TCP peer is a trusted proxy, and
+        # TestClient's default peer is the pseudo-host "testclient" (not a
+        # parseable IP, so never trusted). We opt in here the documented
+        # way: give TestClient a peer address inside the default trusted
+        # CIDR (10.0.0.0/8) so XFF is honored, same as a real deployment
+        # behind a trusted load balancer.
+        fake_ip = "93.184.216.34"  # public IP, not filtered as private by get_real_client_ip
         for _ in range(5):
             _login_limiter._calls[fake_ip].append(__import__("time").monotonic())
 
@@ -183,7 +190,7 @@ class TestRateLimiting:
         for _ in range(5):
             lim._calls[fake_ip].append(time.monotonic())
 
-        client = TestClient(app, raise_server_exceptions=False)
+        client = TestClient(app, raise_server_exceptions=False, client=("10.0.0.1", 12345))
         resp = client.post(
             "/auth/login",
             json={"email": "x@y.com", "password": "p"},
@@ -203,7 +210,11 @@ class TestRateLimiting:
         for _ in range(5):
             lim._calls["1.2.3.4"].append(time.monotonic())
 
-        client = TestClient(app, raise_server_exceptions=False)
+        # SSA-838: TestClient's default peer ("testclient") is not a trusted
+        # proxy, so X-Forwarded-For would be ignored. Use a peer address
+        # inside the default trusted CIDR (10.0.0.0/8) to opt in, the
+        # documented mechanism for this behavior.
+        client = TestClient(app, raise_server_exceptions=False, client=("10.0.0.1", 12345))
 
         async def _mock_post(*args, **kwargs):
             m = MagicMock()
@@ -233,6 +244,157 @@ class TestRateLimiting:
 
         assert resp_a.status_code == 429
         assert resp_b.status_code != 429
+
+
+# ---------------------------------------------------------------------------
+# CRIT-8 (AUDIT Finding #8): response_model= on auth routes
+# ---------------------------------------------------------------------------
+
+class TestResponseModelsCRIT8:
+    """
+    login/signup/me must declare typed response_model schemas (models.py):
+      - documented in OpenAPI (so clients/tools can rely on a real contract)
+      - unexpected / internal fields from the upstream Supabase payload (or
+        from request.state.user) must not leak to the client
+    """
+
+    def test_openapi_declares_login_response_model(self):
+        app = _make_test_app()
+        schema = app.openapi()
+        content = schema["paths"]["/auth/login"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+        assert "LoginResponse" in content.get("$ref", "")
+
+    def test_openapi_declares_signup_response_model(self):
+        app = _make_test_app()
+        schema = app.openapi()
+        content = schema["paths"]["/auth/signup"]["post"]["responses"]["200"]["content"]["application/json"]["schema"]
+        assert "SignupResponse" in content.get("$ref", "")
+
+    def test_openapi_declares_me_response_model(self):
+        from fastapi import FastAPI
+        from routes.auth_routes import router
+
+        app = FastAPI()
+        app.include_router(router)
+        schema = app.openapi()
+        content = schema["paths"]["/auth/me"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        assert "UserResponse" in content.get("$ref", "")
+
+    def test_login_response_model_strips_unexpected_fields(self):
+        """Extra/internal fields in the raw Supabase payload must not leak to the client."""
+        app = _make_test_app()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        supabase_payload = {
+            "access_token": "a.b.c",
+            "refresh_token": "sb-refresh",
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "user": {"email": "x@y.com"},
+            "internal_debug_trace": "should-not-leak",
+        }
+
+        async def _mock_post(*args, **kwargs):
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = supabase_payload
+            return m
+
+        with patch("routes.auth_routes.get_redis", return_value=None):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                instance = AsyncMock()
+                instance.__aenter__ = AsyncMock(return_value=instance)
+                instance.__aexit__ = AsyncMock(return_value=False)
+                instance.post = _mock_post
+                MockClient.return_value = instance
+
+                resp = client.post("/auth/login", json={"email": "x@y.com", "password": "p"})
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "internal_debug_trace" not in body
+        assert body["access_token"] == "a.b.c"
+        assert body["refresh_token"] != "sb-refresh"  # opaque-wrapped
+
+    def test_signup_response_model_strips_unexpected_fields(self):
+        """Extra/internal fields in the raw Supabase signup payload must not leak."""
+        app = _make_test_app()
+        client = TestClient(app, raise_server_exceptions=False)
+
+        supabase_payload = {
+            "access_token": "a.b.c",
+            "refresh_token": "sb-refresh-signup",
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "user": {"email": "new@example.com"},
+            "internal_debug_trace": "should-not-leak",
+        }
+
+        async def _mock_post(*args, **kwargs):
+            m = MagicMock()
+            m.status_code = 200
+            m.json.return_value = supabase_payload
+            return m
+
+        with patch("routes.auth_routes.get_redis", return_value=None):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                instance = AsyncMock()
+                instance.__aenter__ = AsyncMock(return_value=instance)
+                instance.__aexit__ = AsyncMock(return_value=False)
+                instance.post = _mock_post
+                MockClient.return_value = instance
+
+                resp = client.post(
+                    "/auth/signup",
+                    json={
+                        "email": "new@example.com",
+                        "password": "Password123!",
+                        "first_name": "Test",
+                        "last_name": "User",
+                    },
+                )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "internal_debug_trace" not in body
+
+    def test_me_response_model_strips_unexpected_fields_and_types_user_id_as_int(self):
+        """
+        /auth/me must serialize the real production shape (mapping/user_mapping.py
+        produces an int user_id) and filter out any field not in UserResponse.
+        """
+        from fastapi import FastAPI, Request
+        from routes.auth_routes import router
+
+        app = FastAPI()
+
+        class _FakeUser:
+            is_authenticated = True
+
+            def model_dump(self, by_alias=True):
+                return {
+                    "user_id": 42,
+                    "username": "jdoe",
+                    "email": "jdoe@example.com",
+                    "organization": {"id": 1, "name": "Acme", "vertical": "finance"},
+                    "internal_notes": "should-not-leak",
+                }
+
+        @app.middleware("http")
+        async def _inject(request: Request, call_next):
+            request.state.user = _FakeUser()
+            return await call_next(request)
+
+        app.include_router(router)
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.get("/auth/me")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["user_id"] == 42
+        assert isinstance(body["user_id"], int)
+        assert body["organization"]["name"] == "Acme"
+        assert "internal_notes" not in body
 
 
 # ---------------------------------------------------------------------------
