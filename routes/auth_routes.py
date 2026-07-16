@@ -769,7 +769,19 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
     # Password complexity is enforced by PasswordUpdateRequest.validate_password_complexity()
     password = body.new_password
     access_token = _extract_token(request)
+
+    # Resolve the Supabase user id (sub) to revoke refresh tokens for.
+    # The legacy User model exposes `.sub` directly, but the compat User
+    # built by supabase_auth_middleware (middleware/_compat.py) for
+    # standalone deployments does NOT — the raw Supabase UUID only lives
+    # in request.state.supabase_claims['sub']. Fall back to that so
+    # revocation isn't silently skipped for real Supabase-authenticated
+    # requests (P1).
     user_sub = getattr(user, "sub", None)
+    if not user_sub:
+        supabase_claims = getattr(request.state, "supabase_claims", None)
+        if supabase_claims:
+            user_sub = supabase_claims.get("sub")
 
     async with _http_client(request) as client:
         resp = await client.put(

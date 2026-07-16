@@ -73,9 +73,35 @@ def _is_supabase_token(payload: dict[str, Any]) -> bool:
 
 AUTHORIZATION_HEADER = "Authorization"
 
+# Endpoints that must remain reachable even when the caller's Authorization
+# header is missing, expired, or otherwise invalid — because the handler
+# either doesn't require auth at all, or (in the case of /auth/refresh)
+# authenticates via the *request body* rather than the bearer token.
+#
+# Without this, a client that always attaches its (possibly stale) access
+# token gets 401'd by this middleware before /auth/refresh ever gets a
+# chance to use the body's refresh token to mint a new session (P2).
+#
+# Handler-level auth still applies where it exists (e.g. /auth/me,
+# /auth/update-password are NOT in this set and continue to require a
+# valid bearer token).
+PUBLIC_PATHS: frozenset[str] = frozenset({
+    "/auth/login",
+    "/auth/signup",
+    "/auth/refresh",
+    "/auth/reset-password",
+    "/health",
+})
+
+
+def _is_public_path(path: str) -> bool:
+    return path in PUBLIC_PATHS
+
 
 async def supabase_auth_middleware(request: Request, call_next: Callable):
     """Auth middleware supporting Supabase, ForwardLane, or dual mode."""
+
+    optional = _is_public_path(request.url.path)
 
     if AUTHORIZATION_HEADER not in request.headers:
         request.state.user = AnonymousUser()
@@ -88,34 +114,42 @@ async def supabase_auth_middleware(request: Request, call_next: Callable):
 
     # --- Supabase-only ---
     if mode == AuthMode.SUPABASE:
-        return await _handle_supabase(token, request, call_next)
+        return await _handle_supabase(token, request, call_next, optional=optional)
 
     # --- ForwardLane-only ---
     if mode == AuthMode.FORWARDLANE:
-        return await _handle_forwardlane(token, request, call_next)
+        return await _handle_forwardlane(token, request, call_next, optional=optional)
 
     # --- Dual mode: try Supabase first, fall back to ForwardLane ---
     try:
         # Peek at the unverified payload to decide which path to take
         unverified = pyjwt.decode(token, options={"verify_signature": False})
         if _is_supabase_token(unverified):
-            return await _handle_supabase(token, request, call_next)
+            return await _handle_supabase(token, request, call_next, optional=optional)
     except Exception:
         pass
 
-    return await _handle_forwardlane(token, request, call_next)
+    return await _handle_forwardlane(token, request, call_next, optional=optional)
 
 
-async def _handle_supabase(token: str, request: Request, call_next: Callable):
+async def _handle_supabase(
+    token: str, request: Request, call_next: Callable, optional: bool = False
+):
     try:
         claims = _verify_supabase_jwt(token)
     except pyjwt.ExpiredSignatureError:
+        if optional:
+            request.state.user = AnonymousUser()
+            return await call_next(request)
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={"detail": "Token expired"},
         )
     except pyjwt.InvalidTokenError as exc:
         logger.warning("Supabase JWT invalid: %s", exc)
+        if optional:
+            request.state.user = AnonymousUser()
+            return await call_next(request)
         return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
             content={"detail": "Invalid JWT token"},
@@ -128,8 +162,13 @@ async def _handle_supabase(token: str, request: Request, call_next: Callable):
     return await call_next(request)
 
 
-async def _handle_forwardlane(token: str, request: Request, call_next: Callable):
+async def _handle_forwardlane(
+    token: str, request: Request, call_next: Callable, optional: bool = False
+):
     if not _legacy_available:
+        if optional:
+            request.state.user = AnonymousUser()
+            return await call_next(request)
         return JSONResponse(
             status_code=status.HTTP_501_NOT_IMPLEMENTED,
             content={"detail": "ForwardLane auth not available in this deployment"},
@@ -138,6 +177,9 @@ async def _handle_forwardlane(token: str, request: Request, call_next: Callable)
     try:
         await ForwardlaneApiService.verify_jwt_token(token)
     except Exception as exc:
+        if optional:
+            request.state.user = AnonymousUser()
+            return await call_next(request)
         status_code = getattr(exc, "status_code", 500)
         if status_code == status.HTTP_400_BAD_REQUEST:
             return JSONResponse(
