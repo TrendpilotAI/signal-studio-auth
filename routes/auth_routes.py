@@ -689,7 +689,9 @@ async def revoke_user_sessions(user_id: str, request: Request):
     server-side.
 
     Requires the caller to be authenticated AND have the 'admin' role in
-    their Supabase app_metadata — same RBAC pattern as /invite-to-org.
+    their Supabase app_metadata — same RBAC pattern as /invite-to-org,
+    including the org-membership scoping (an admin of org A must NOT be
+    able to revoke sessions for a user in org B).
     """
     caller = getattr(request.state, "user", None)
     if not caller or not caller.is_authenticated:
@@ -703,6 +705,35 @@ async def revoke_user_sessions(user_id: str, request: Request):
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Admin role required to revoke user sessions",
         )
+
+    # SECURITY: enforce org membership — an admin of org A must NOT be able
+    # to revoke sessions for a user in org B (same pattern as invite_to_org's
+    # organization_members check).
+    caller_claims = getattr(request.state, "supabase_claims", None)
+    caller_org_id = (
+        (caller_claims or {}).get("app_metadata", {}).get("organization_id")
+    )
+    if caller_org_id is not None:
+        async with _http_client(request) as membership_client:
+            membership_resp = await membership_client.get(
+                f"{SUPABASE_URL}/rest/v1/organization_members",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "org_id": f"eq.{caller_org_id}",
+                    "select": "user_id",
+                    "limit": "1",
+                },
+                headers={
+                    **_supabase_headers(service=True),
+                    "Accept": "application/json",
+                },
+            )
+            members = membership_resp.json() if membership_resp.status_code == 200 else []
+            if not isinstance(members, list) or len(members) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot revoke sessions for a user outside your organization.",
+                )
 
     revoked_count = _revoke_all_user_tokens(user_id)
     logger.info(

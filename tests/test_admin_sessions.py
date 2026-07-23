@@ -170,6 +170,101 @@ class TestAdminRevokeSessionsSuccess:
 
         assert resp.status_code == 200
 
+    def test_admin_revoke_cross_org_returns_403_and_leaves_tokens(self):
+        """Admin of org A must NOT be able to revoke sessions for a user in
+        org B — mirrors the /invite-to-org organization_members guard
+        (TODO-602). Regression test for the missing check found in review."""
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from routes.auth_routes import router
+
+        redis = _fake_redis()
+        target_user = "org-b-victim-uuid"
+        token_a = str(uuid.uuid4())
+        _seed_token(redis, token_a, target_user)
+
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def inject_auth(request: Request, call_next):
+            user = MagicMock()
+            user.is_authenticated = True
+            request.state.user = user
+            request.state.supabase_claims = {
+                "sub": "admin-of-org-a",
+                "app_metadata": {"role": "admin", "organization_id": 1},
+            }
+            return await call_next(request)
+
+        app.include_router(router)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        membership_resp = MagicMock()
+        membership_resp.status_code = 200
+        membership_resp.json.return_value = []  # victim is NOT in caller's org
+
+        http_mock = MagicMock()
+        http_mock.return_value.__aenter__.return_value.get = AsyncMock(return_value=membership_resp)
+        http_mock.return_value.__aenter__.return_value.post = AsyncMock()
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            with patch("routes.auth_routes.httpx.AsyncClient", http_mock):
+                resp = client.delete(f"/auth/admin/users/{target_user}/sessions")
+
+        assert resp.status_code == 403
+        assert "organization" in resp.json()["detail"].lower()
+
+        # Cross-org revocation must be a no-op: the victim's token survives.
+        assert redis.hgetall(f"rt:{token_a}") != {}
+        # And Supabase logout must never have been called for the victim.
+        http_mock.return_value.__aenter__.return_value.post.assert_not_called()
+
+    def test_admin_revoke_same_org_allowed(self):
+        """Admin whose organization_id matches the target user's org (per
+        organization_members) may revoke — the membership guard passes."""
+        from fastapi import FastAPI, Request
+        from fastapi.testclient import TestClient
+        from routes.auth_routes import router
+
+        redis = _fake_redis()
+        target_user = "org-a-user-uuid"
+        token_a = str(uuid.uuid4())
+        _seed_token(redis, token_a, target_user)
+
+        app = FastAPI()
+
+        @app.middleware("http")
+        async def inject_auth(request: Request, call_next):
+            user = MagicMock()
+            user.is_authenticated = True
+            request.state.user = user
+            request.state.supabase_claims = {
+                "sub": "admin-of-org-a",
+                "app_metadata": {"role": "admin", "organization_id": 1},
+            }
+            return await call_next(request)
+
+        app.include_router(router)
+        client = TestClient(app, raise_server_exceptions=False)
+
+        membership_resp = MagicMock()
+        membership_resp.status_code = 200
+        membership_resp.json.return_value = [{"user_id": target_user}]  # same org
+
+        logout_resp = MagicMock()
+        logout_resp.status_code = 204
+
+        http_mock = MagicMock()
+        http_mock.return_value.__aenter__.return_value.get = AsyncMock(return_value=membership_resp)
+        http_mock.return_value.__aenter__.return_value.post = AsyncMock(return_value=logout_resp)
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            with patch("routes.auth_routes.httpx.AsyncClient", http_mock):
+                resp = client.delete(f"/auth/admin/users/{target_user}/sessions")
+
+        assert resp.status_code == 200
+        assert redis.hgetall(f"rt:{token_a}") == {}
+
     def test_admin_revoke_survives_supabase_logout_failure(self):
         """Redis revocation must not be undone just because Supabase's admin
         logout call fails — this is best-effort against the upstream API,
