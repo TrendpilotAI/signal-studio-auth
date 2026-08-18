@@ -27,20 +27,24 @@ def _get_caller_role(request: Request) -> str:
     """
     Extract the caller's role from Supabase JWT claims.
 
-    Priority order (highest wins):
-    1. ``app_metadata.role`` — set server-side via service key, cannot be forged by users
-    2. ``user_metadata.role`` — fallback (user-editable, lower trust)
+    Only ``app_metadata.role`` is trusted — it is set server-side via the
+    Supabase service key and cannot be forged by the end user.
 
-    Returns an empty string if the request is unauthenticated or claims are absent.
+    ``user_metadata.role`` is intentionally NOT consulted: Supabase end
+    users can edit their own ``user_metadata`` (e.g. via the client-side
+    ``updateUser`` API), so honoring it here would let anyone self-assign
+    a privileged role such as ``admin`` or ``org_manager``. See the
+    privilege-escalation fix in TASK S7.
+
+    Returns an empty string if the request is unauthenticated, claims are
+    absent, or no role is set in ``app_metadata``.
     """
     claims = getattr(request.state, "supabase_claims", None)
     if claims is None:
         return ""
-    # app_metadata is set by the service key — this is the authoritative field
+    # app_metadata is set by the service key — this is the ONLY authoritative
+    # field. Do not fall back to user_metadata.role (user-editable, forgeable).
     role = claims.get("app_metadata", {}).get("role", "")
-    if not role:
-        # Graceful fallback to user_metadata (lower trust)
-        role = claims.get("user_metadata", {}).get("role", "")
     return role or ""
 
 

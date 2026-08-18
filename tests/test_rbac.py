@@ -6,7 +6,8 @@ Covers:
 - Authenticated with wrong role → 403
 - Authenticated with correct role → 200
 - Multiple allowed roles (any one passes)
-- Role stored in app_metadata (primary) and user_metadata (fallback)
+- Role stored in app_metadata (the ONLY trusted source — see TASK S7)
+- user_metadata.role is NEVER honored (privilege-escalation guard, TASK S7)
 - require_role() with no args raises ValueError at definition time
 - Case-insensitive role matching
 """
@@ -150,6 +151,54 @@ class TestRequireRoleCaseInsensitive:
         assert resp.status_code == 200
 
 
+class TestRequireRoleRejectsUserMetadataSelfAssignment:
+    """
+    Regression test for privilege escalation via user_metadata.role.
+
+    Supabase end users can edit their own user_metadata (e.g. via the
+    client-side `updateUser` API), so a token whose claims carry a role
+    ONLY in user_metadata (no app_metadata.role) must NOT satisfy
+    require_role() — otherwise any authenticated user can self-assign
+    admin/org_manager and bypass RBAC entirely.
+    """
+
+    def test_user_metadata_only_admin_role_is_rejected_via_helper(self):
+        from middleware.rbac import _get_caller_role
+
+        req = MagicMock()
+        req.state.supabase_claims = {
+            "app_metadata": {},
+            "user_metadata": {"role": "admin"},
+        }
+        # A token carrying ONLY user_metadata.role='admin' (no
+        # app_metadata.role) must resolve to no privileged role at all.
+        assert _get_caller_role(req) == ""
+
+    def test_user_metadata_only_admin_role_gets_403_end_to_end(self):
+        """End-to-end: a request whose claims carry ONLY
+        user_metadata.role='admin' (no app_metadata.role) must be
+        rejected with 403 from an admin-gated endpoint."""
+
+        app2 = FastAPI()
+
+        @app2.get("/admin-only", dependencies=[require_role("admin")])
+        async def admin_only(request: Request):
+            return {"ok": True}
+
+        @app2.middleware("http")
+        async def inject_user_metadata_only_claims(request: Request, call_next):
+            request.state.user = _mock_user(authenticated=True)
+            request.state.supabase_claims = {
+                "app_metadata": {},
+                "user_metadata": {"role": "admin"},
+            }
+            return await call_next(request)
+
+        local_client = TestClient(app2, raise_server_exceptions=False)
+        resp = local_client.get("/admin-only")
+        assert resp.status_code == 403
+
+
 class TestRequireRoleDefinitionErrors:
     def test_no_args_raises_value_error(self):
         with pytest.raises(ValueError, match="at least one role"):
@@ -166,7 +215,12 @@ class TestGetCallerRole:
         req.state.supabase_claims = {"app_metadata": {"role": "admin"}}
         assert _get_caller_role(req) == "admin"
 
-    def test_falls_back_to_user_metadata(self):
+    def test_does_not_fall_back_to_user_metadata(self):
+        # TASK S7 (privilege escalation fix): user_metadata is user-editable
+        # via Supabase's client-side updateUser API, so it must NEVER be
+        # honored as a role source, even when app_metadata.role is absent.
+        # A legitimate role change must be provisioned server-side into
+        # app_metadata (via the service key), not read from user_metadata.
         from middleware.rbac import _get_caller_role
 
         req = MagicMock()
@@ -174,7 +228,7 @@ class TestGetCallerRole:
             "app_metadata": {},
             "user_metadata": {"role": "org_manager"},
         }
-        assert _get_caller_role(req) == "org_manager"
+        assert _get_caller_role(req) == ""
 
     def test_returns_empty_string_when_no_claims(self):
         from middleware.rbac import _get_caller_role
