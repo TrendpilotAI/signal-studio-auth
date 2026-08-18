@@ -385,6 +385,213 @@ class TestUpdatePassword:
 # Rate limiting tests for new routes
 # ---------------------------------------------------------------------------
 
+class TestUpdatePasswordRevokesRefreshTokens:
+    """
+    CRIT-5 (AUDIT Finding #5): after a successful password change, all of the
+    user's outstanding opaque refresh tokens must be revoked in Redis so a
+    stolen refresh token cannot outlive the password reset.
+    """
+
+    def setup_method(self):
+        _update_password_calls.clear()
+
+    def test_stolen_refresh_token_revoked_after_password_change(self):
+        """A token belonging to the user must be deleted; other users' tokens must survive."""
+        import fakeredis
+        import uuid as uuid_mod
+
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        user_sub = "user-uuid-1234"  # matches _make_jwt() default sub
+
+        stolen_token = str(uuid_mod.uuid4())
+        family_id = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{stolen_token}", mapping={
+            "user_id": user_sub,
+            "family_id": family_id,
+            "parent_id": "",
+            "supabase_token": "supabase-rt-stolen",
+            "consumed": "0",
+        })
+        redis.sadd(f"rt:family:{family_id}", stolen_token)
+
+        # A second token in the same family must also be revoked.
+        sibling_token = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{sibling_token}", mapping={
+            "user_id": user_sub,
+            "family_id": family_id,
+            "parent_id": stolen_token,
+            "supabase_token": "supabase-rt-sibling",
+            "consumed": "0",
+        })
+        redis.sadd(f"rt:family:{family_id}", sibling_token)
+
+        # A token belonging to a DIFFERENT user must survive untouched.
+        other_token = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{other_token}", mapping={
+            "user_id": "some-other-user",
+            "family_id": "other-family",
+            "parent_id": "",
+            "supabase_token": "supabase-rt-other",
+            "consumed": "0",
+        })
+        redis.sadd("rt:family:other-family", other_token)
+
+        app = _make_app(authenticated=True)
+        token = _make_jwt(sub=user_sub)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value={"id": user_sub})
+
+        mock_client = AsyncMock()
+        mock_client.put = AsyncMock(return_value=mock_resp)
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+                MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/auth/update-password",
+                    json={"new_password": "SuperSecret99"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+
+        # The stolen token and its family sibling must be gone.
+        assert redis.hgetall(f"rt:{stolen_token}") == {}
+        assert redis.hgetall(f"rt:{sibling_token}") == {}
+        assert redis.smembers(f"rt:family:{family_id}") == set()
+
+        # Another user's token must be untouched.
+        assert redis.hgetall(f"rt:{other_token}").get("supabase_token") == "supabase-rt-other"
+        assert other_token in redis.smembers("rt:family:other-family")
+
+    def test_no_redis_is_a_safe_no_op(self):
+        """When Redis is unavailable, password update should still succeed (best-effort)."""
+        app = _make_app(authenticated=True)
+        token = _make_jwt()
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value={"id": "user-uuid-1234"})
+
+        mock_client = AsyncMock()
+        mock_client.put = AsyncMock(return_value=mock_resp)
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+
+        with patch("routes.auth_routes.get_redis", return_value=None):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+                MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/auth/update-password",
+                    json={"new_password": "SuperSecret99"},
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+
+        assert resp.status_code == 200
+
+
+class TestUpdatePasswordRevocationUsesSupabaseClaimsSub:
+    """
+    P1 regression: the compat User built by supabase_auth_middleware
+    (middleware/_compat.py) does NOT have a `.sub` attribute — the raw
+    Supabase UUID only lives in request.state.supabase_claims['sub']. If
+    update_password resolves user_sub via `getattr(user, "sub", None)`
+    alone, that returns None for every real Supabase-authenticated request
+    running standalone, and token revocation is silently skipped.
+
+    This test reproduces the actual middleware shape (unlike the other
+    tests in this file, which inject a MagicMock with `.sub` pre-set,
+    masking the bug) and asserts revocation still fires using the sub
+    resolved from supabase_claims.
+    """
+
+    def setup_method(self):
+        _update_password_calls.clear()
+
+    def test_revokes_tokens_via_supabase_claims_sub_when_user_has_no_sub_attr(self):
+        import fakeredis
+        import uuid as uuid_mod
+
+        from mapping.user_mapping import supabase_claims_to_user_dict
+        from middleware._compat import User as CompatUser
+
+        user_sub = str(uuid_mod.uuid4())
+        claims = {
+            "sub": user_sub,
+            "email": "standalone@example.com",
+            "aud": "authenticated",
+            "app_metadata": {"organization_id": 1, "role": "viewer"},
+            "user_metadata": {"first_name": "Test", "last_name": "User"},
+        }
+        # This is exactly what middleware.supabase_auth_middleware._handle_supabase
+        # puts on request.state.user for a real Supabase JWT.
+        compat_user = CompatUser(**supabase_claims_to_user_dict(claims))
+        assert not hasattr(compat_user, "sub"), (
+            "sanity check: compat User must NOT expose .sub — otherwise this "
+            "test stops reproducing the real middleware shape"
+        )
+
+        redis = fakeredis.FakeRedis(decode_responses=True)
+        token_id = str(uuid_mod.uuid4())
+        family_id = str(uuid_mod.uuid4())
+        redis.hset(f"rt:{token_id}", mapping={
+            "user_id": user_sub,
+            "family_id": family_id,
+            "parent_id": "",
+            "supabase_token": "supabase-rt-standalone",
+            "consumed": "0",
+        })
+        redis.sadd(f"rt:family:{family_id}", token_id)
+
+        app = FastAPI()
+        app.include_router(router)
+        app.state.http_client = None
+
+        @app.middleware("http")
+        async def _inject_standalone_middleware_state(request: Request, call_next):
+            request.state.user = compat_user
+            request.state.supabase_claims = claims
+            return await call_next(request)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value={"id": user_sub})
+
+        mock_client = AsyncMock()
+        mock_client.put = AsyncMock(return_value=mock_resp)
+        mock_client.post = AsyncMock(return_value=MagicMock(status_code=200))
+
+        access_token = _make_jwt(sub=user_sub)
+
+        with patch("routes.auth_routes.get_redis", return_value=redis):
+            with patch("routes.auth_routes.httpx.AsyncClient") as MockClient:
+                MockClient.return_value.__aenter__ = AsyncMock(return_value=mock_client)
+                MockClient.return_value.__aexit__ = AsyncMock(return_value=False)
+
+                client = TestClient(app)
+                resp = client.post(
+                    "/auth/update-password",
+                    json={"new_password": "SuperSecret99"},
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+
+        assert resp.status_code == 200
+
+        # The token belonging to the Supabase-claims sub must be revoked —
+        # proving update_password resolved the sub from supabase_claims,
+        # not from the (nonexistent) user.sub attribute.
+        assert redis.hgetall(f"rt:{token_id}") == {}
+        assert redis.smembers(f"rt:family:{family_id}") == set()
+
+
 class TestPasswordResetRateLimit:
 
     def setup_method(self):

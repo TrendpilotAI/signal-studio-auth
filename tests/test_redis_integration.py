@@ -417,14 +417,17 @@ class TestRateLimiting:
         _login_calls.clear()
         _signup_calls.clear()
 
-    def _build_test_app(self):
+    def _build_test_app(self, client=None):
         from fastapi import FastAPI
         from fastapi.testclient import TestClient
         from routes.auth_routes import router
 
         app = FastAPI()
         app.include_router(router)
-        return TestClient(app, raise_server_exceptions=False)
+        kwargs = {"raise_server_exceptions": False}
+        if client is not None:
+            kwargs["client"] = client
+        return TestClient(app, **kwargs)
 
     def _supabase_ok_mock(self):
         """A Supabase mock that always returns 200 with a valid auth response."""
@@ -480,7 +483,13 @@ class TestRateLimiting:
     def test_different_ips_have_independent_rate_limits(self):
         """Rate limit buckets are per-IP; different IPs should not share quotas."""
         self._clear_limiters()
-        client = self._build_test_app()
+        # SSA-838: X-Forwarded-For is only honored when the TCP peer is a
+        # trusted proxy. TestClient's default peer ("testclient") is not a
+        # parseable IP and is therefore never trusted, so give it a peer
+        # address inside the default trusted CIDR (10.0.0.0/8) — the
+        # documented opt-in — so this test still exercises per-IP XFF
+        # bucketing rather than everything collapsing onto one peer key.
+        client = self._build_test_app(client=("10.0.0.1", 12345))
 
         with patch("routes.auth_routes.get_redis", return_value=None):
             with patch("httpx.AsyncClient", self._supabase_ok_mock()):

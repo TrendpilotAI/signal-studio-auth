@@ -32,6 +32,7 @@ from config.redis_config import get_redis, REDIS_URL
 from config.supabase_config import SUPABASE_SERVICE_KEY, SUPABASE_URL
 from middleware.rbac import _get_caller_role
 from middleware.trusted_proxy import get_real_client_ip
+from models import LoginResponse, SignupResponse, UserResponse
 
 logger = logging.getLogger(__name__)
 
@@ -309,6 +310,52 @@ def _revoke_opaque_token(opaque_token: str) -> bool:
     return existed
 
 
+def _revoke_all_user_tokens(user_id: str) -> int:
+    """
+    Best-effort revocation of every outstanding opaque refresh token that
+    belongs to *user_id* (CRIT-5 / AUDIT Finding #5, SSA-836).
+
+    Used after a password change (and by the admin "revoke sessions"
+    endpoint) so a token stolen prior to the change/revocation cannot
+    outlive it.
+
+    Implementation: SCAN over the "rt:*" keyspace (never KEYS, to avoid
+    blocking Redis), skip the "rt:family:*" SET keys, and delete any token
+    hash whose stored "user_id" field matches. Also removes the token id
+    from its family SET to keep that tidy.
+
+    Returns the number of tokens revoked. No-op (returns 0) when Redis is
+    unavailable — the in-memory fallback used by config/redis_config.py
+    keeps no persistent token store to scan, so there is nothing to revoke
+    there (opaque tokens issued in that mode carry no server-side state).
+    """
+    r = get_redis()
+    if r is None or not user_id:
+        return 0
+
+    revoked = 0
+    cursor = 0
+    while True:
+        cursor, keys = r.scan(cursor=cursor, match=f"{REFRESH_TOKEN_PREFIX}*", count=100)
+        for key in keys:
+            if key.startswith(f"{REFRESH_TOKEN_PREFIX}family:"):
+                continue
+            data = r.hgetall(key)
+            if not data or data.get("user_id") != user_id:
+                continue
+            token_id = key[len(REFRESH_TOKEN_PREFIX):]
+            family_id = data.get("family_id", "")
+            pipe = r.pipeline()
+            pipe.delete(key)
+            if family_id:
+                pipe.srem(f"{REFRESH_TOKEN_PREFIX}family:{family_id}", token_id)
+            pipe.execute()
+            revoked += 1
+        if cursor == 0:
+            break
+    return revoked
+
+
 def _wrap_with_opaque_token(supabase_response: dict, user_id: str = "") -> dict:
     """
     Replace the Supabase refresh_token in the response with an opaque family token.
@@ -425,7 +472,7 @@ def _extract_token(request: Request) -> str:
 # Routes
 # ---------------------------------------------------------------------------
 
-@router.post("/signup")
+@router.post("/signup", response_model=SignupResponse)
 async def signup(body: SignupRequest, request: Request):
     """Register a new user via Supabase Auth."""
     _signup_limiter.check(_client_ip(request))
@@ -451,7 +498,7 @@ async def signup(body: SignupRequest, request: Request):
     return _wrap_with_opaque_token(resp.json())
 
 
-@router.post("/login")
+@router.post("/login", response_model=LoginResponse)
 async def login(body: LoginRequest, request: Request):
     """Authenticate and receive tokens (refresh token is opaque UUID)."""
     _login_limiter.check(_client_ip(request))
@@ -542,7 +589,7 @@ async def logout(request: Request, body: LogoutRequest | None = None):
     return {"detail": "Logged out"}
 
 
-@router.get("/me")
+@router.get("/me", response_model=UserResponse)
 async def me(request: Request):
     """Return current user info from the middleware-populated state."""
     user = getattr(request.state, "user", None)
@@ -631,6 +678,86 @@ async def invite_to_org(body: InviteRequest, request: Request):
     return {"detail": "Invitation sent", "email": body.email}
 
 
+@router.delete("/admin/users/{user_id}/sessions")
+async def revoke_user_sessions(user_id: str, request: Request):
+    """
+    Admin-only: revoke all of a target user's sessions (SSA-836).
+
+    Revokes every outstanding opaque refresh token for *user_id* in Redis
+    (reusing the CRIT-5 SCAN helper, _revoke_all_user_tokens) and calls the
+    Supabase admin logout endpoint to invalidate that user's live sessions
+    server-side.
+
+    Requires the caller to be authenticated AND have the 'admin' role in
+    their Supabase app_metadata — same RBAC pattern as /invite-to-org,
+    including the org-membership scoping (an admin of org A must NOT be
+    able to revoke sessions for a user in org B).
+    """
+    caller = getattr(request.state, "user", None)
+    if not caller or not caller.is_authenticated:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # SECURITY: enforce admin role — any authenticated user must NOT be able
+    # to revoke another user's sessions.
+    caller_role = _get_caller_role(request)
+    if caller_role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin role required to revoke user sessions",
+        )
+
+    # SECURITY: enforce org membership — an admin of org A must NOT be able
+    # to revoke sessions for a user in org B (same pattern as invite_to_org's
+    # organization_members check).
+    caller_claims = getattr(request.state, "supabase_claims", None)
+    caller_org_id = (
+        (caller_claims or {}).get("app_metadata", {}).get("organization_id")
+    )
+    if caller_org_id is not None:
+        async with _http_client(request) as membership_client:
+            membership_resp = await membership_client.get(
+                f"{SUPABASE_URL}/rest/v1/organization_members",
+                params={
+                    "user_id": f"eq.{user_id}",
+                    "org_id": f"eq.{caller_org_id}",
+                    "select": "user_id",
+                    "limit": "1",
+                },
+                headers={
+                    **_supabase_headers(service=True),
+                    "Accept": "application/json",
+                },
+            )
+            members = membership_resp.json() if membership_resp.status_code == 200 else []
+            if not isinstance(members, list) or len(members) == 0:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail="Cannot revoke sessions for a user outside your organization.",
+                )
+
+    revoked_count = _revoke_all_user_tokens(user_id)
+    logger.info(
+        "revoke_user_sessions: revoked %d opaque refresh token(s) for user %s",
+        revoked_count, user_id,
+    )
+
+    # Best-effort: also force Supabase to invalidate live sessions server-side.
+    try:
+        async with _http_client(request) as client:
+            await client.post(
+                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}/logout",
+                headers=_supabase_headers(service=True),
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("revoke_user_sessions: Supabase logout call failed: %s", exc)
+
+    return {
+        "detail": "Sessions revoked",
+        "user_id": user_id,
+        "revoked_tokens": revoked_count,
+    }
+
+
 @router.post("/reset-password")
 async def reset_password(body: PasswordResetRequest, request: Request):
     """
@@ -673,7 +800,19 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
     # Password complexity is enforced by PasswordUpdateRequest.validate_password_complexity()
     password = body.new_password
     access_token = _extract_token(request)
+
+    # Resolve the Supabase user id (sub) to revoke refresh tokens for.
+    # The legacy User model exposes `.sub` directly, but the compat User
+    # built by supabase_auth_middleware (middleware/_compat.py) for
+    # standalone deployments does NOT — the raw Supabase UUID only lives
+    # in request.state.supabase_claims['sub']. Fall back to that so
+    # revocation isn't silently skipped for real Supabase-authenticated
+    # requests (P1).
     user_sub = getattr(user, "sub", None)
+    if not user_sub:
+        supabase_claims = getattr(request.state, "supabase_claims", None)
+        if supabase_claims:
+            user_sub = supabase_claims.get("sub")
 
     async with _http_client(request) as client:
         resp = await client.put(
@@ -686,10 +825,16 @@ async def update_password(body: PasswordUpdateRequest, request: Request):
         raise HTTPException(status_code=400, detail="Password update failed")
 
     # Revoke all existing opaque refresh tokens for this user in Redis
-    # We do a best-effort scan; if Redis is unavailable this is a no-op.
+    # (CRIT-5 / AUDIT Finding #5). We do a best-effort scan; if Redis is
+    # unavailable this is a no-op.
     try:
         r = get_redis()
         if r is not None and user_sub:
+            revoked_count = _revoke_all_user_tokens(user_sub)
+            logger.info(
+                "update_password: revoked %d opaque refresh token(s) for user %s",
+                revoked_count, user_sub,
+            )
             # Also force Supabase to invalidate all sessions via admin API
             async with _http_client(request) as client:
                 await client.post(
